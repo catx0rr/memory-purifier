@@ -59,7 +59,7 @@ Views are regenerated every run. Do not edit them by hand.
 - `mode: "silent" | "summary" | "full"` — when enabled, shapes chat output
   - `silent` — nothing in chat
   - `summary` (default) — one-line compact report
-  - `full` — bullet-list report with a `🪙 Token Usage` block (omitted when `tokenUsage.source == "unavailable"`)
+  - `full` — bullet-list report with a `Token Usage` block (omitted when `tokenUsage.source == "unavailable"`)
 
 Telemetry and `last-run.md` are written **regardless** of reporting settings — only chat delivery is gated.
 
@@ -154,14 +154,11 @@ Stable hash IDs in `purified-claims.jsonl` (`cl-<16-hex>`) are **purifier-local 
 - **Test coverage expanded.** Eight new regression tests cover announce validation, skip enrichment, weighted recall scoring, sync-helper edge cases, long-horizon prior lookup, reworded-claim reuse normalization, supersession-chain warning, and the v1.3.0 stale-sweep render bugfix (locked).
 - **Self-contained docs.** Stale external-doctrine citations removed from `scripts/discover_sources.py`, `references/config-template.md`, and `references/source-contract.md`; relevant rules restated inline so the package reads standalone.
 
-## Maintenance behaviors (v1.3.0)
+For older maintenance behavior history (v1.3.0 and earlier), see [CHANGELOG.md](CHANGELOG.md).
 
-- **OpenClaw announce delivery semantics.** Cron registration now uses the explicit `--announce --channel <channel> --to <id>` form when `--cron-announce true`, matching OpenClaw cron docs. `--cron-announce false` continues to use `--no-deliver`. `scripts/sync_cron_delivery.py` mirrors this when flipping delivery mode. Both `--cron-announce-channel` and `--cron-announce-to` are required non-empty when announce is on; OpenClaw owns channel validation at registration time, and the installer surfaces its errors without swallowing them.
-- **Smart-skip enrichment.** Runs that skip on no-new-work (`skipped` / `skipped_superseded`) now include `claimsTotal`, `nextSchedule`, and a bounded `recallSurface` (one oldest unresolved / contested / retire_candidate claim, if any) in the deterministic summary and local `last-run.md`. Chat behavior unchanged — skips stay silent; the recall surface is local-report-only.
-- **Prior-claim context is ranked, not recency-sliced.** Pass 2 receives the top-N prior claims by relevance to the current clusters (subject match, entity overlap, home affinity, text Jaccard), not the most-recent N. See [`references/prompt-contracts.md §5.6`](references/prompt-contracts.md).
-- **Source removal triggers `retire_candidate`, never silent delete.** When a source file disappears from `sourceInventory`, `assemble_artifacts.py` marks claims whose provenance depends only on that source with `status: "retire_candidate"` and records a `retirementReasons[]` trace. Retired claims remain in `purified-claims.jsonl` for audit but are excluded from routes and rendered views.
-- **Semantic reuse on rewording.** When Pass 2 emits `claim_id: "<new>"`, `assemble_artifacts.py` first checks for an active prior claim with matching `(subject, predicate, primary_home)`; if found, the new claim reuses that id and becomes an in-place update rather than a duplicate.
-- **Runtime supersession guard.** Incremental runs that fall inside a reconciliation window (per `cadence.reconciliation[]`) skip cleanly with `status: "skipped_superseded"` regardless of cron drift.
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Testing
 

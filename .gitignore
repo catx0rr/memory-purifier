@@ -1,0 +1,7 @@
+# Design-time spec notes
+.spec/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo

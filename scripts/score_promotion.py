@@ -21,6 +21,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 DEFAULT_BACKEND = "claude-code"
 VALID_VERDICTS = {"reject", "defer", "compress", "merge", "promote"}
@@ -32,16 +35,6 @@ SCORE_KEYS = [
     "cross_time_persistence",
     "noise_risk",
 ]
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 def compute_strength(scores: dict) -> float:
@@ -324,6 +317,32 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=300, help="Backend call timeout in seconds")
     ap.add_argument("--timezone", help="IANA timezone name (default: from candidates or Asia/Manila)")
     ap.add_argument("--dry-run", action="store_true", help="Validate only; do not persist JSONL or write failure files")
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="v1.5.0 A3 (Contract 5): split candidates into deterministic chunks of this size "
+             "and invoke the backend once per chunk. 0 = monolithic single call (v1.4.0 behavior). "
+             "Chunk boundaries are sorted by candidate_id for rerun stability.",
+    )
+    ap.add_argument(
+        "--oversized-hard-cap",
+        type=int,
+        default=10,
+        help="v1.5.0 A3: maximum number of batches processed per run. Input larger than "
+             "batch_size × hard_cap triggers the --oversized-strategy. Default: 10 (i.e., "
+             "with default batch_size=40 this caps each run at 400 candidates).",
+    )
+    ap.add_argument(
+        "--oversized-strategy",
+        default="bounded_batches",
+        choices=("bounded_batches", "split_and_queue"),
+        help="v1.5.0 A3: behavior when input exceeds batch_size × hard_cap. "
+             "`bounded_batches` processes up to hard_cap batches, marks remainder as "
+             "partial_failure with partialBatches metadata. `split_and_queue` processes "
+             "the first hard_cap worth, writes remainder to <runtime>/pending-candidates-<run_id>.jsonl "
+             "for the next run to pick up.",
+    )
 
     args = ap.parse_args()
 
@@ -379,50 +398,100 @@ def main() -> int:
     runtime_dir = Path(args.runtime_dir).expanduser() if args.runtime_dir else (workspace / "runtime")
     locks_dir = runtime_dir / "locks"
 
-    input_payload = {
+    # v1.5.0 A3 (Contract 5): batching. When --batch-size > 0, split
+    # candidates into deterministic chunks by sorted candidate_id and
+    # invoke the backend once per chunk. 0 = monolithic single call.
+    sorted_candidates = sorted(candidates, key=lambda c: str(c.get("candidate_id", "")))
+    if args.batch_size and args.batch_size > 0:
+        batch_size = args.batch_size
+        chunks = [sorted_candidates[i:i + batch_size] for i in range(0, len(sorted_candidates), batch_size)]
+    else:
+        batch_size = len(sorted_candidates) or 1
+        chunks = [sorted_candidates] if sorted_candidates else []
+
+    # Oversized-run policy: if total batches exceeds hard_cap, apply strategy
+    # before any invocation. The queue file for split_and_queue is written
+    # only when the run proceeds successfully up to hard_cap; a failure
+    # before that point leaves the full input to be retried naturally.
+    pending_candidates: list = []
+    oversized_truncated = False
+    if args.oversized_hard_cap > 0 and len(chunks) > args.oversized_hard_cap:
+        processed = chunks[: args.oversized_hard_cap]
+        remainder = [cand for chunk in chunks[args.oversized_hard_cap:] for cand in chunk]
+        pending_candidates = remainder
+        chunks = processed
+        oversized_truncated = True
+
+    base_payload = {
         "run_id": run_id,
         "mode": cand_obj.get("mode", "incremental"),
         "profile_scope": cand_obj.get("profile_scope", "business"),
-        "candidates": candidates,
     }
 
+    all_verdicts: list = []
     last_errors: list = []
     raw_response = None
     verdicts_obj = None
     attempts = 0
     total_usage = _usage_unavailable()
+    batch_failed = False
 
-    for _ in range(args.retry + 1):
-        attempts += 1
-        try:
-            resp = invoke_backend(
-                backend=backend,
-                prompt_file=prompt_path,
-                input_payload=input_payload,
-                fixture_dir=args.fixture_dir,
-                fixture_file=args.fixture_file,
-                model=args.model,
-                max_tokens=args.max_tokens,
-                timeout=args.timeout,
-            )
-            raw_response = resp["raw"]
-            total_usage = _merge_usage(total_usage, resp.get("usage") or _usage_unavailable())
-        except Exception as e:
-            last_errors = [f"backend invocation failed: {type(e).__name__}: {e}"]
-            continue
+    for chunk_idx, chunk in enumerate(chunks):
+        input_payload = {**base_payload, "candidates": chunk}
+        chunk_ids = {str(c.get("candidate_id", "")) for c in chunk}
+        chunk_verdicts = None
 
-        try:
-            parsed = extract_json(raw_response)
-        except Exception as e:
-            last_errors = [f"JSON parse failed: {type(e).__name__}: {e}"]
-            continue
+        for _ in range(args.retry + 1):
+            attempts += 1
+            try:
+                resp = invoke_backend(
+                    backend=backend,
+                    prompt_file=prompt_path,
+                    input_payload=input_payload,
+                    fixture_dir=args.fixture_dir,
+                    fixture_file=args.fixture_file,
+                    model=args.model,
+                    max_tokens=args.max_tokens,
+                    timeout=args.timeout,
+                )
+                raw_response = resp["raw"]
+                total_usage = _merge_usage(total_usage, resp.get("usage") or _usage_unavailable())
+            except Exception as e:
+                last_errors = [f"batch {chunk_idx}: backend invocation failed: {type(e).__name__}: {e}"]
+                continue
 
-        ok, errors = validate_verdicts(parsed, candidates, run_id)
-        if ok:
-            verdicts_obj = parsed
-            last_errors = []
+            try:
+                parsed = extract_json(raw_response)
+            except Exception as e:
+                last_errors = [f"batch {chunk_idx}: JSON parse failed: {type(e).__name__}: {e}"]
+                continue
+
+            # When batching, the file-backend default fixture may carry
+            # verdicts for IDs outside this chunk. Filter defensively BEFORE
+            # validation so batched file-backend runs work without hash-keyed
+            # per-batch fixtures. Production backends are expected to return
+            # only the requested candidates anyway.
+            if args.batch_size and isinstance(parsed, dict) and isinstance(parsed.get("verdicts"), list):
+                parsed["verdicts"] = [v for v in parsed["verdicts"] if str(v.get("candidate_id", "")) in chunk_ids]
+
+            ok, errors = validate_verdicts(parsed, chunk, run_id)
+            if ok:
+                chunk_verdicts = parsed["verdicts"]
+                last_errors = []
+                break
+            last_errors = [f"batch {chunk_idx}: {e}" for e in errors]
+
+        if chunk_verdicts is None:
+            batch_failed = True
             break
-        last_errors = errors
+        all_verdicts.extend(chunk_verdicts)
+
+    if not batch_failed and chunks:
+        verdicts_obj = {"run_id": run_id, "verdicts": all_verdicts}
+
+    # Keep `candidates` ref pointing at the ORIGINAL input for downstream stats
+    # that need the full-set count (candidate_count, etc.).
+    input_payload = {**base_payload, "candidates": candidates}
 
     if verdicts_obj is None:
         fail_path = locks_dir / f"purifier-failed-promotion-{run_id}.json"
@@ -495,8 +564,30 @@ def main() -> int:
         if deferred:
             _append_jsonl(runtime_dir / "deferred-candidates.jsonl", deferred)
 
+    # v1.5.0 A3: if the run was truncated by the oversized policy, mark it
+    # partial_failure with deterministic metadata the orchestrator can
+    # surface to the operator. split_and_queue also writes the remainder
+    # to a queue file so the next run picks it up.
+    oversized_status = None
+    queue_path = None
+    partial_batches = None
+    if oversized_truncated:
+        partial_batches = {
+            "pending_candidate_count": len(pending_candidates),
+            "pending_candidate_ids": [c["candidate_id"] for c in pending_candidates],
+            "strategy": args.oversized_strategy,
+        }
+        if args.oversized_strategy == "split_and_queue" and not args.dry_run:
+            queue_path = runtime_dir / f"pending-candidates-{run_id}.jsonl"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            with queue_path.open("w", encoding="utf-8") as fh:
+                for cand in pending_candidates:
+                    fh.write(json.dumps(cand, ensure_ascii=False) + "\n")
+            partial_batches["queue_path"] = str(queue_path)
+        oversized_status = "partial_failure"
+
     out = {
-        "status": "ok",
+        "status": oversized_status or "ok",
         "run_id": run_id,
         "pass": "promotion",
         "backend": backend,
@@ -511,6 +602,9 @@ def main() -> int:
         "deferred_written": 0 if args.dry_run else len(deferred),
         "survivors": survivors,
         "token_usage": total_usage,
+        "batch_count": len(chunks),
+        "batch_size": batch_size,
+        "partialBatches": partial_batches,
         "dry_run": args.dry_run,
         **ts,
     }

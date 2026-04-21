@@ -26,6 +26,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 DEFAULT_BACKEND = "claude-code"
 
@@ -34,7 +37,7 @@ VALID_TYPES = {
     "identity", "relationship", "method", "procedure", "episode",
     "aspiration", "milestone", "open_question",
 }
-VALID_STATUSES = {"resolved", "contested", "unresolved", "superseded", "stale", "retire_candidate"}
+VALID_STATUSES = {"resolved", "contested", "unresolved", "superseded", "stale", "retire_candidate", "probable_duplicate"}
 VALID_HOMES = {"LTMEMORY.md", "PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}
 PERSONAL_ONLY_HOMES = {"HISTORY.md", "WISHES.md"}
 VALID_FRESHNESS = {"fresh", "recent", "aging", "stale"}
@@ -58,6 +61,28 @@ PRIOR_PER_CLUSTER = 5
 PRIOR_MIN_SCORE = 0.5
 CONTRADICTION_CANDIDATES_PER_CLUSTER = 3
 
+# v1.5.0 B1 (Contract 5) adaptive widening defaults.
+#
+# ``SAME_SUBJECT_BONUS_WINDOW_DAYS``: a prior whose normalized subject matches
+# the current cluster AND whose ``updated_at`` falls within this window gets a
+# ``SAME_SUBJECT_BONUS_SCORE`` bonus. Keeps long-horizon same-subject priors
+# from being drowned by fresher but less-relevant matches.
+#
+# ``CONTRADICTION_PRESSURE_BONUS``: extra top-K slots granted to clusters
+# showing borderline priors (scored just below min_score). Lets Pass 2
+# adjudicate contradictions it might otherwise miss. Bounded by
+# ``WIDENING_MAX_TOTAL_BONUS`` across the whole run so contradiction-pressure
+# widening can't balloon the context.
+#
+# ``RECONCILIATION_*`` caps: reconciliation mode runs with wider horizon by
+# design (it's an explicit reprocess). Incremental uses the tighter defaults.
+SAME_SUBJECT_BONUS_WINDOW_DAYS = 30
+SAME_SUBJECT_BONUS_SCORE = 1.0
+CONTRADICTION_PRESSURE_BONUS = 3
+WIDENING_MAX_TOTAL_BONUS = 30
+RECONCILIATION_GLOBAL_CAP = 120
+RECONCILIATION_PER_CLUSTER = 10
+
 # v1.4.0: English stopwords filtered from Jaccard inputs. Small conservative
 # set — avoids stemming, keeps deterministic. Dropping these prevents a
 # claim scoring positively just because it shares common function words
@@ -67,16 +92,6 @@ _STOPWORDS = frozenset({
     "to", "of", "and", "or", "in", "on", "at", "for", "with", "by",
     "this", "that", "these", "those", "it", "as", "from",
 })
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 def _snake_from_camel(claim_camel: dict) -> dict:
@@ -187,26 +202,56 @@ def _rank_prior_claim(query: dict, claim: dict) -> float:
     return score
 
 
+def _days_since(iso_ts: str) -> float:
+    """Crude days-ago helper for the same-subject window check.
+
+    Returns ``float('inf')`` on unparseable / empty timestamps so the
+    window never admits undated priors. Uses UTC to avoid host-tz skew.
+    """
+    if not iso_ts:
+        return float("inf")
+    try:
+        dt = datetime.fromisoformat(str(iso_ts).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return float("inf")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    return max(0.0, (now - dt.astimezone(timezone.utc)).total_seconds() / 86400.0)
+
+
 def retrieve_prior_claims(
     path: Path,
     clusters: list,
     cap: int = PRIOR_CLAIMS_CAP,
     per_cluster: int = PRIOR_PER_CLUSTER,
     min_score: float = PRIOR_MIN_SCORE,
+    *,
+    mode: str = "incremental",
+    same_subject_window_days: int = SAME_SUBJECT_BONUS_WINDOW_DAYS,
+    contradiction_pressure_bonus: int = CONTRADICTION_PRESSURE_BONUS,
+    widening_max_total_bonus: int = WIDENING_MAX_TOTAL_BONUS,
+    reconciliation_global_cap: int = RECONCILIATION_GLOBAL_CAP,
+    reconciliation_per_cluster: int = RECONCILIATION_PER_CLUSTER,
 ) -> list:
-    """Load all prior purified claims, rank per-cluster, union the top-K, cap.
+    """Load prior purified claims, rank per-cluster with adaptive widening, cap.
 
-    v1.4.0: per-cluster top-K union replaces the global single-ranking slice.
-    Rationale: guarantees every cluster gets at least its top-K most-relevant
-    priors rather than competing for a global budget where one dominant
-    cluster can starve others. Sub-threshold noise (score < min_score) is
-    dropped even when the pool is under-cap so stopword-only matches don't
-    fill slots. Global cap still applies as a final trim.
+    v1.4.0: per-cluster top-K union (hard floor per cluster, global cap trim).
 
-    Side-effect: also populates each cluster's
-    `cluster_hints.contradiction_candidates` with the top-N ranked priors
-    (ids only) for that cluster — Pass 2 already consumes this field per
-    the prompt contract; the clusterer leaves it empty by design.
+    v1.5.0 B1 (Contract 5) additions — all still bounded, all deterministic:
+    - **Same-subject bonus window.** Priors whose normalized subject matches
+      the current cluster AND whose ``updated_at`` is within
+      ``same_subject_window_days`` receive ``SAME_SUBJECT_BONUS_SCORE``,
+      surfacing long-horizon same-subject priors that fresher generic
+      matches would otherwise outrank.
+    - **Contradiction-pressure widening.** Clusters with borderline priors
+      (score in [min_score-0.2, min_score)) get ``contradiction_pressure_bonus``
+      extra top-K slots. Global budget ``widening_max_total_bonus`` caps the
+      aggregate bonus so one noisy cluster can't balloon the context.
+    - **Reconciliation mode wider caps.** ``mode == "reconciliation"`` uses
+      ``reconciliation_global_cap`` and ``reconciliation_per_cluster`` in
+      place of the incremental caps — reconciliation is an explicit
+      reprocess, so the horizon widens.
     """
     if not path.is_file():
         return []
@@ -225,25 +270,55 @@ def retrieve_prior_claims(
 
     snake = [_snake_from_camel(r) for r in records]
     if not clusters:
-        # No clusters to rank against — fall back to recency.
         snake.sort(key=lambda c: c.get("updated_at") or "", reverse=True)
         return snake[:cap]
 
+    # v1.5.0 B1: reconciliation mode uses wider caps.
+    if mode == "reconciliation":
+        cap = max(cap, reconciliation_global_cap)
+        per_cluster = max(per_cluster, reconciliation_per_cluster)
+
     queries = [_cluster_query(c) for c in clusters]
 
-    # Per-cluster top-K: for each cluster, rank all priors against that
-    # cluster's query; keep the K above min_score. Also capture top-N ids
-    # for the contradiction_candidates side-effect.
     union_by_id: dict = {}
     union_max_score: dict = {}
+    total_bonus_spent = 0
     for cluster, query in zip(clusters, queries):
         ranked = []
+        borderline_count = 0
         for claim in snake:
-            score = _rank_prior_claim(query, claim)
-            if score >= min_score:
-                ranked.append((score, claim.get("updated_at") or "", claim))
+            base_score = _rank_prior_claim(query, claim)
+
+            # Same-subject bonus window — claim's subject matches query's
+            # subject AND the claim was updated recently enough.
+            claim_subject = str(claim.get("subject") or "").strip().lower()
+            query_subject = str(query.get("subject") or "").strip().lower()
+            if (
+                claim_subject
+                and query_subject
+                and claim_subject == query_subject
+                and _days_since(claim.get("updated_at")) <= same_subject_window_days
+            ):
+                base_score += SAME_SUBJECT_BONUS_SCORE
+
+            # Track borderline priors so we can widen this cluster's budget.
+            if (min_score - 0.2) <= base_score < min_score:
+                borderline_count += 1
+
+            if base_score >= min_score:
+                ranked.append((base_score, claim.get("updated_at") or "", claim))
         ranked.sort(key=lambda x: (-x[0], _recency_neg(x[1])))
-        per_cluster_top = ranked[:per_cluster]
+
+        # Contradiction-pressure widening: if this cluster had borderline
+        # priors, grant a bounded top-K bonus, respecting the global budget.
+        cluster_per_cluster = per_cluster
+        if borderline_count > 0 and total_bonus_spent < widening_max_total_bonus:
+            room = widening_max_total_bonus - total_bonus_spent
+            bonus = min(contradiction_pressure_bonus, room)
+            cluster_per_cluster += bonus
+            total_bonus_spent += bonus
+
+        per_cluster_top = ranked[:cluster_per_cluster]
 
         # Populate the cluster's contradiction_candidates with the top-N ids.
         hints = cluster.setdefault("cluster_hints", {})
@@ -598,6 +673,21 @@ def main() -> int:
     ap.add_argument("--prior-claims-cap", type=int, default=PRIOR_CLAIMS_CAP, help="Global cap on prior claims returned to Pass 2 (final trim after per-cluster union)")
     ap.add_argument("--prior-per-cluster", type=int, default=PRIOR_PER_CLUSTER, help="Per-cluster top-K taken before global union (guarantees small clusters don't starve)")
     ap.add_argument("--prior-min-score", type=float, default=PRIOR_MIN_SCORE, help="Minimum rank score below which a prior claim is filtered out even if the pool is under-cap")
+    ap.add_argument(
+        "--same-subject-window-days",
+        type=int,
+        default=SAME_SUBJECT_BONUS_WINDOW_DAYS,
+        help="v1.5.0 B1: priors with matching subject whose updated_at is within this window "
+             "receive a bonus score, surfacing long-horizon same-subject matches.",
+    )
+    ap.add_argument(
+        "--contradiction-pressure-bonus",
+        type=int,
+        default=CONTRADICTION_PRESSURE_BONUS,
+        help="v1.5.0 B1: extra top-K slots granted to clusters with borderline priors "
+             "(scored just below min_score). Bounded by a global budget so contradiction "
+             "pressure can't balloon the context.",
+    )
     ap.add_argument("--backend", default=None, help="Model backend: claude-code | anthropic-sdk | file")
     ap.add_argument("--model", help="Model override")
     ap.add_argument("--max-tokens", type=int, help="Max output tokens")
@@ -607,6 +697,29 @@ def main() -> int:
     ap.add_argument("--timeout", type=int, default=300, help="Backend call timeout in seconds")
     ap.add_argument("--timezone", help="IANA timezone name (default: from clusters or Asia/Manila)")
     ap.add_argument("--dry-run", action="store_true", help="Validate only; do not write failure records")
+    ap.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="v1.5.0 A3 (Contract 5): split clusters into deterministic chunks of this size "
+             "and invoke the backend once per chunk. Each chunk receives the FULL prior_claims_context "
+             "— retrieval runs once per run, not per batch. 0 = monolithic call (v1.4.0 behavior). "
+             "Chunk boundaries are sorted by cluster_id for rerun stability.",
+    )
+    ap.add_argument(
+        "--oversized-hard-cap",
+        type=int,
+        default=10,
+        help="v1.5.0 A3: maximum number of batches processed per run. Input larger than "
+             "batch_size × hard_cap triggers the --oversized-strategy.",
+    )
+    ap.add_argument(
+        "--oversized-strategy",
+        default="bounded_batches",
+        choices=("bounded_batches", "split_and_queue"),
+        help="v1.5.0 A3: oversized handling. `bounded_batches` processes up to hard_cap batches "
+             "and reports partial. `split_and_queue` also writes the remainder to a queue file.",
+    )
 
     args = ap.parse_args()
 
@@ -675,54 +788,101 @@ def main() -> int:
         cap=args.prior_claims_cap,
         per_cluster=args.prior_per_cluster,
         min_score=args.prior_min_score,
+        mode=mode,
+        same_subject_window_days=args.same_subject_window_days,
+        contradiction_pressure_bonus=args.contradiction_pressure_bonus,
     ) if prior_path else []
     prior_claim_ids = {c["claim_id"] for c in prior_claims_context if c.get("claim_id")}
 
-    input_payload = {
+    # v1.5.0 A3 (Contract 5): sort clusters deterministically before batching
+    # so reruns produce identical chunk boundaries.
+    sorted_clusters = sorted(clusters, key=lambda c: str(c.get("cluster_id", "")))
+    if args.batch_size and args.batch_size > 0:
+        batch_size = args.batch_size
+        chunks = [sorted_clusters[i:i + batch_size] for i in range(0, len(sorted_clusters), batch_size)]
+    else:
+        batch_size = len(sorted_clusters) or 1
+        chunks = [sorted_clusters] if sorted_clusters else []
+
+    pending_clusters: list = []
+    oversized_truncated = False
+    if args.oversized_hard_cap > 0 and len(chunks) > args.oversized_hard_cap:
+        processed = chunks[: args.oversized_hard_cap]
+        remainder = [cl for chunk in chunks[args.oversized_hard_cap:] for cl in chunk]
+        pending_clusters = remainder
+        chunks = processed
+        oversized_truncated = True
+
+    base_payload = {
         "run_id": run_id,
         "mode": mode,
         "profile_scope": profile_scope,
-        "clusters": clusters,
         "prior_claims_context": prior_claims_context,
     }
 
+    all_claims: list = []
     last_errors: list = []
     raw_response = None
     claims_obj = None
     attempts = 0
     total_usage = _usage_unavailable()
+    batch_failed = False
 
-    for _ in range(args.retry + 1):
-        attempts += 1
-        try:
-            resp = invoke_backend(
-                backend=backend,
-                prompt_file=prompt_path,
-                input_payload=input_payload,
-                fixture_dir=args.fixture_dir,
-                fixture_file=args.fixture_file,
-                model=args.model,
-                max_tokens=args.max_tokens,
-                timeout=args.timeout,
-            )
-            raw_response = resp["raw"]
-            total_usage = _merge_usage(total_usage, resp.get("usage") or _usage_unavailable())
-        except Exception as e:
-            last_errors = [f"backend invocation failed: {type(e).__name__}: {e}"]
-            continue
+    for chunk_idx, chunk in enumerate(chunks):
+        input_payload = {**base_payload, "clusters": chunk}
+        chunk_cluster_ids = {str(cl.get("cluster_id", "")) for cl in chunk}
+        chunk_claims = None
 
-        try:
-            parsed = extract_json(raw_response)
-        except Exception as e:
-            last_errors = [f"JSON parse failed: {type(e).__name__}: {e}"]
-            continue
+        for _ in range(args.retry + 1):
+            attempts += 1
+            try:
+                resp = invoke_backend(
+                    backend=backend,
+                    prompt_file=prompt_path,
+                    input_payload=input_payload,
+                    fixture_dir=args.fixture_dir,
+                    fixture_file=args.fixture_file,
+                    model=args.model,
+                    max_tokens=args.max_tokens,
+                    timeout=args.timeout,
+                )
+                raw_response = resp["raw"]
+                total_usage = _merge_usage(total_usage, resp.get("usage") or _usage_unavailable())
+            except Exception as e:
+                last_errors = [f"batch {chunk_idx}: backend invocation failed: {type(e).__name__}: {e}"]
+                continue
 
-        ok, errors = validate_claims(parsed, clusters, run_id, profile_scope, prior_claim_ids)
-        if ok:
-            claims_obj = parsed
-            last_errors = []
+            try:
+                parsed = extract_json(raw_response)
+            except Exception as e:
+                last_errors = [f"batch {chunk_idx}: JSON parse failed: {type(e).__name__}: {e}"]
+                continue
+
+            # Defensive filter: file-backend fixtures may carry the full-run
+            # canonical_claims set; keep only the ones that map to THIS chunk.
+            if args.batch_size and isinstance(parsed, dict) and isinstance(parsed.get("canonical_claims"), list):
+                parsed["canonical_claims"] = [
+                    c for c in parsed["canonical_claims"]
+                    if str(c.get("source_cluster_id", "")) in chunk_cluster_ids
+                ]
+
+            ok, errors = validate_claims(parsed, chunk, run_id, profile_scope, prior_claim_ids)
+            if ok:
+                chunk_claims = parsed.get("canonical_claims", [])
+                last_errors = []
+                break
+            last_errors = [f"batch {chunk_idx}: {e}" for e in errors]
+
+        if chunk_claims is None:
+            batch_failed = True
             break
-        last_errors = errors
+        all_claims.extend(chunk_claims)
+
+    if not batch_failed and chunks:
+        claims_obj = {"run_id": run_id, "canonical_claims": all_claims}
+
+    # Restore full-input reference for downstream metadata fields.
+    input_payload = {**base_payload, "clusters": clusters}
 
     if claims_obj is None:
         fail_path = locks_dir / f"purifier-failed-purifier-{run_id}.json"
@@ -772,8 +932,26 @@ def main() -> int:
         if claim.get("contradictions"):
             contradiction_count += 1
 
+    # v1.5.0 A3: oversized metadata; downgrade to partial_failure when truncated.
+    oversized_status = None
+    partial_batches = None
+    if oversized_truncated:
+        partial_batches = {
+            "pending_cluster_count": len(pending_clusters),
+            "pending_cluster_ids": [cl.get("cluster_id") for cl in pending_clusters],
+            "strategy": args.oversized_strategy,
+        }
+        if args.oversized_strategy == "split_and_queue" and not args.dry_run:
+            queue_path = runtime_dir / f"pending-clusters-{run_id}.jsonl"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            with queue_path.open("w", encoding="utf-8") as fh:
+                for cl in pending_clusters:
+                    fh.write(json.dumps(cl, ensure_ascii=False) + "\n")
+            partial_batches["queue_path"] = str(queue_path)
+        oversized_status = "partial_failure"
+
     out = {
-        "status": "ok",
+        "status": oversized_status or "ok",
         "run_id": run_id,
         "pass": "purifier",
         "backend": backend,
@@ -789,6 +967,9 @@ def main() -> int:
         "prior_claims_context_used": len(prior_claims_context),
         "canonical_claims": canonical_claims,
         "token_usage": total_usage,
+        "batch_count": len(chunks),
+        "batch_size": batch_size,
+        "partialBatches": partial_batches,
         "dry_run": args.dry_run,
         **timestamp_triple(tz_name),
     }

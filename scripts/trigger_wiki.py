@@ -24,18 +24,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 DEFAULT_CONFIG = Path.home() / ".openclaw" / "memory-purifier" / "memory-purifier.json"
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 def _load_json_safely(path: Path) -> dict:
@@ -45,13 +38,9 @@ def _load_json_safely(path: Path) -> dict:
         return {}
 
 
-def _atomic_write_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+# v1.5.0 audit-corrective: delegate to shared fs helper so the atomic-write
+# contract (temp-sibling + fsync + os.replace) lives in one place.
+from _lib.fs import atomic_write_json as _atomic_write_json  # noqa: E402
 
 
 def main() -> int:
@@ -92,8 +81,27 @@ def main() -> int:
 
     manifest = _load_json_safely(manifest_path)
     suggested = bool(manifest.get("downstreamWikiIngestSuggested"))
+    # v1.5.0 A2 (Contract 2): wiki signal is allowed only when the manifest
+    # declares itself committed AND the run completed ok. Defense-in-depth
+    # gate — the orchestrator already skips calling us on non-committed
+    # runs, but a manual invocation without this check could leak a signal
+    # from an uncommitted manifest.
+    publish_committed = bool(manifest.get("publishCommitted"))
     run_id = manifest.get("runId")
     run_status = manifest.get("status")
+
+    if not publish_committed:
+        out = {
+            "status": "skipped",
+            "reason": "manifest.publishCommitted is false — run did not publish",
+            "pass": "trigger_wiki",
+            "run_id": run_id,
+            "run_status": run_status,
+            "dry_run": args.dry_run,
+            **ts,
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
 
     if not suggested:
         out = {

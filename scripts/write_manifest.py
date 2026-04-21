@@ -16,21 +16,35 @@ Shared-memory-log telemetry (`memory-log-YYYY-MM-DD.jsonl`) and the
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+from _lib.statuses import CANONICAL_TOP_LEVEL_STATUSES  # noqa: E402
+from _lib.version import (  # noqa: E402
+    PURIFIER_ARTIFACT_SCHEMA,
+    PURIFIER_LOGIC_VERSION,
+    PURIFIER_MANIFEST_SCHEMA,
+    PURIFIER_PACKAGE_VERSION,
+)
 
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
+
+def _runtime_state_version(
+    logic_version: str, manifest_schema: str, artifact_schema: str
+) -> str:
+    """Short hash fingerprint of the three load-bearing version identifiers.
+
+    Used purely as a quick "has anything that matters changed" check —
+    not as a migration signal in itself. The state machine inspects the
+    individual fields.
+    """
+    raw = f"{logic_version}|{manifest_schema}|{artifact_schema}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:12]
 
 
 def _load_json_maybe(path_str: str):
@@ -52,13 +66,9 @@ def _first_nonempty(*objs, key):
     return None
 
 
-def _atomic_write_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+# v1.5.0 audit-corrective: delegate to shared fs helper so atomic-write
+# semantics live in one place (temp-sibling + fsync + os.replace).
+from _lib.fs import atomic_write_json as _atomic_write_json  # noqa: E402
 
 
 def main() -> int:
@@ -77,14 +87,24 @@ def main() -> int:
     ap.add_argument("--config", help="Path to memory-purifier.json config")
     ap.add_argument(
         "--status",
-        choices=["ok", "skipped", "partial_failure", "error"],
+        # v1.5.0 Contract 1 — single-sourced from `_lib.statuses` so this
+        # list stays byte-identical with `run_purifier.CANONICAL_STATUSES`
+        # and `validate_outputs.check_manifest` status gate.
+        choices=list(CANONICAL_TOP_LEVEL_STATUSES),
         default="ok",
-        help="Final run status",
+        help="Final run status (locked taxonomy, v1.5.0 Contract 1)",
     )
     ap.add_argument("--warnings", default="[]", help="JSON array of extra warnings to record")
     ap.add_argument("--partial-failures", default="[]", help="JSON array of extra partial failures to record")
     ap.add_argument("--views-rendered", default="[]", help="JSON array of rendered view paths (from render_views.py)")
     ap.add_argument("--timezone", help="IANA timezone name")
+    ap.add_argument(
+        "--output-dir",
+        help="Override for the MANIFEST output directory (v1.5.0 A2). Default = --runtime-dir "
+             "(back-compat). The last-run summary and config cursor are unaffected — only the "
+             "manifest itself stages. The orchestrator promotes the staged manifest as the "
+             "last step of the publish sequence (Contract 2).",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Compute everything; do not write files")
 
     args = ap.parse_args()
@@ -104,9 +124,11 @@ def main() -> int:
 
     run_id = args.run_id or _first_nonempty(pass2, assemble, pass1, scope, inv, key="run_id")
     if not run_id:
+        # v1.5.0 Contract 1: write_manifest's own emitted status must land
+        # inside the locked taxonomy. Missing run_id is a hard failure.
         out = {
-            "status": "error",
-            "error": "could not determine run_id from any upstream input or --run-id",
+            "status": "failed",
+            "reason": "could not determine run_id from any upstream input or --run-id",
             "pass": "manifest",
             **finished_ts,
         }
@@ -132,7 +154,11 @@ def main() -> int:
     telemetry_root = Path(args.telemetry_root).expanduser() if args.telemetry_root else (Path.home() / ".openclaw" / "telemetry" / "memory-purifier")
     config_path = Path(args.config).expanduser() if args.config else (Path.home() / ".openclaw" / "memory-purifier" / "memory-purifier.json")
 
-    manifest_path = runtime_dir / "purified-manifest.json"
+    # A2: manifest stages when --output-dir is provided; summary stays in
+    # runtime_dir (it's a latest-state diagnostic, never a committed artifact).
+    manifest_output_dir = Path(args.output_dir).expanduser() if args.output_dir else runtime_dir
+    manifest_output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = manifest_output_dir / "purified-manifest.json"
     summary_path = runtime_dir / "purifier-last-run-summary.json"
 
     try:
@@ -187,8 +213,87 @@ def main() -> int:
         and (assemble or {}).get("status") == "ok"
     )
 
+    # v1.5.0 C1 (Contract 3) — four-version model + lastSuccessfulLogicVersion
+    # memo. On `ok`, lastSuccessfulLogicVersion advances to the running logic
+    # version; on any other status it carries forward from the prior manifest
+    # so the upgrade state machine can still detect mismatches after a
+    # failure.
+    package_version = PURIFIER_PACKAGE_VERSION
+    try:
+        cfg_on_disk = json.loads(config_path.read_text()) if config_path.is_file() else {}
+        configured = cfg_on_disk.get("version")
+        if isinstance(configured, str) and configured:
+            package_version = configured
+    except (OSError, ValueError):
+        pass
+
+    prior_manifest = _load_json_maybe(str(manifest_path)) or {}
+    last_successful_logic_version = (
+        PURIFIER_LOGIC_VERSION
+        if args.status == "ok"
+        else prior_manifest.get("lastSuccessfulLogicVersion")
+    )
+
+    # v1.5.0 Contract 4 §39 — per-run `routeValidationWarnings[]`.
+    #
+    # IMPORTANT: in staged publish mode the manifest for this run goes to
+    # ``manifest_output_dir`` (``<staging>/publish/``), and the claims that
+    # actually belong to THIS run live in that same staging dir — NOT in
+    # ``runtime_dir`` (which still holds the prior-committed state until
+    # promote lands). Reading from runtime_dir in staged mode would mix
+    # prior-run claims into this run's diagnostic, making the manifest
+    # warnings stale/mismatched relative to the just-validated staged set.
+    #
+    # Source selection rule:
+    #   - staged mode (``--output-dir`` set): read from ``manifest_output_dir``
+    #   - live mode (back-compat standalone invocation): read from runtime_dir
+    route_warnings_source_dir = manifest_output_dir if args.output_dir else runtime_dir
+    route_warnings: list = []
+    try:
+        claims_path = route_warnings_source_dir / "purified-claims.jsonl"
+        if claims_path.is_file():
+            with claims_path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        claim_row = json.loads(line)
+                    except ValueError:
+                        continue
+                    state = claim_row.get("routeValidationState")
+                    if state and state != "strong":
+                        route_warnings.append({
+                            "claim_id": claim_row.get("id"),
+                            "chosen_home": claim_row.get("primaryHome"),
+                            "suggested_home": claim_row.get("routeSuggestedHome"),
+                            "type": claim_row.get("type"),
+                            "state": state,
+                        })
+    except OSError:
+        pass
+
     manifest = {
-        "version": "1.4.0",
+        # The legacy `version` key stays for backward-read compatibility with
+        # any consumer that read `manifest.version` before the four-version
+        # split landed. New callers should prefer `packageVersion`.
+        "version": package_version,
+        "packageVersion": package_version,
+        "logicVersion": PURIFIER_LOGIC_VERSION,
+        "manifestSchemaVersion": PURIFIER_MANIFEST_SCHEMA,
+        "artifactSchemaVersion": PURIFIER_ARTIFACT_SCHEMA,
+        "runtimeStateVersion": _runtime_state_version(
+            PURIFIER_LOGIC_VERSION, PURIFIER_MANIFEST_SCHEMA, PURIFIER_ARTIFACT_SCHEMA
+        ),
+        "lastSuccessfulLogicVersion": last_successful_logic_version,
+        # v1.5.0 C1 (Contract 3) detection fields — always present on every
+        # manifest, populated only when the upgrade state machine fires
+        # (blocked run). Default null / false on normal runs so downstream
+        # readers can rely on their presence without a "has key?" probe.
+        "upgradeRequired": False,
+        "upgradeReason": None,
+        "upgradeBlockedAt": None,
+        "requiresForcedReconciliation": False,
         "runId": run_id,
         "mode": mode,
         "status": args.status,
@@ -204,10 +309,23 @@ def main() -> int:
         "homeStats": home_stats,
         "warnings": warnings,
         "partialFailures": partial_failures,
-        "lastSuccessfulCursor": cursor_new if args.status == "ok" else (
-            _load_json_maybe(str(manifest_path)) or {}
-        ).get("lastSuccessfulCursor"),
+        # v1.5.0 B3 (Contract 4 §39) — per-run route validation warnings surface.
+        # Populated from the staged/committed claims JSONL. Empty list means
+        # every claim landed at its strong home.
+        "routeValidationWarnings": route_warnings,
+        "lastSuccessfulCursor": cursor_new if args.status == "ok" else prior_manifest.get("lastSuccessfulCursor"),
         "downstreamWikiIngestSuggested": bool(downstream_suggested),
+        # v1.5.0 A2 (Contract 2) — publish-contract fields. write_manifest.py
+        # always initializes these to "not yet committed" state; the
+        # orchestrator flips them to committed state atomically right before
+        # promoting the manifest as the commit marker. If promotion never
+        # happens, these fields stay false and `trigger_wiki.py` suppresses.
+        "publishCommitted": False,
+        "publishedAt": None,
+        "publishedArtifactSet": [],
+        "publishedViewSet": [],
+        "downstreamWikiSignalEmitted": False,
+        "commitRunId": None,
     }
 
     duration_seconds = None
@@ -249,7 +367,12 @@ def main() -> int:
     # (manifest, summary, config cursor).
 
     config_update = None
-    if config_path.is_file():
+    # v1.5.0 A2: when staging, defer the config-cursor update. The
+    # orchestrator advances the cursor only AFTER validation passes and
+    # the staged manifest has been promoted — no half-committed cursor if
+    # validation fails.
+    staged_write = args.output_dir is not None
+    if config_path.is_file() and not staged_write:
         try:
             cfg = json.loads(config_path.read_text())
         except json.JSONDecodeError:
@@ -264,6 +387,7 @@ def main() -> int:
                 config_update = cfg
 
     if not args.dry_run:
+        manifest_output_dir.mkdir(parents=True, exist_ok=True)
         runtime_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_json(manifest_path, manifest)
         _atomic_write_json(summary_path, summary)

@@ -5,3 +5,6 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Test harness (not shipped with the package)
+tests/

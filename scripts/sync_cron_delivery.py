@@ -67,24 +67,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 MEMORY_PURIFIER_JOB_PREFIX = "memory-purifier-"
 INCREMENTAL_PROMPT_FILENAME = "incremental-purifier-prompt.md"
 RECONCILIATION_PROMPT_FILENAME = "reconciliation-purifier-prompt.md"
-
-
-# ── time ──────────────────────────────────────────────────────────────
-
-def _timestamp_triple() -> dict[str, str]:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    tz = now_local.tzinfo
-    tz_name = getattr(tz, "key", None) or now_local.strftime("%Z") or now_local.strftime("UTC%z")
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 # ── state readers ─────────────────────────────────────────────────────
@@ -317,6 +306,9 @@ def sync(
     skill_root: Path,
     dry_run: bool,
 ) -> dict[str, Any]:
+    # Resolve cron_cfg first so we emit timestamps in the configured cron tz
+    # (not system-local — that was the v1.5.0 A1 bypass).
+    cron_cfg = read_cron_config(config_path)
     plan: dict[str, Any] = {
         "ok": True,
         "status": "in_sync",
@@ -330,7 +322,7 @@ def sync(
         "jobs": [],
         "changes": 0,
         "errors": [],
-        **_timestamp_triple(),
+        **timestamp_triple(cron_cfg["tz"]),
     }
 
     reporting_state = read_reporting_state(workspace)
@@ -344,7 +336,6 @@ def sync(
     # so the result JSON surfaces these fields even when we later short-circuit
     # on `skipped_no_openclaw` or `skipped_no_jobs`. Useful for operators
     # debugging a sync from a workstation without openclaw installed.
-    cron_cfg = read_cron_config(config_path)
     resolved_channel = reporting_state["delivery_channel"] or cron_cfg["announce_channel"]
     resolved_to = reporting_state["delivery_to"] or cron_cfg["announce_to"]
     plan["desired_channel"] = resolved_channel

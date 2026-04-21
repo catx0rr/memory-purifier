@@ -19,6 +19,9 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 TYPE_TO_PRIMARY_HOME = {
     "fact": "LTMEMORY.md",
@@ -42,16 +45,6 @@ STOPWORDS = {
     "The", "When", "This", "That", "These", "Those", "What", "How", "Why",
     "Where", "Who", "Operator", "User",
 }
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 class UnionFind:

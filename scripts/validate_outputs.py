@@ -24,13 +24,71 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+from _lib.statuses import CANONICAL_TOP_LEVEL_STATUS_SET  # noqa: E402
+
 
 VALID_TYPES = {
     "fact", "lesson", "decision", "commitment", "constraint", "preference",
     "identity", "relationship", "method", "procedure", "episode",
     "aspiration", "milestone", "open_question",
 }
-VALID_STATUSES = {"resolved", "contested", "unresolved", "superseded", "stale", "retire_candidate"}
+
+# v1.5.0 B3 (Contract 4/spec) — type→home affinity table.
+# Each type maps to (strong_home, acceptable_homes_set, impossible_homes_set).
+# - strong: the semantically-expected home — no warning, no error.
+# - acceptable: plausible edge case — warning only; claim still published.
+# - impossible: semantic contradiction — hard error, claim rejected.
+# Homes NOT in any of the three categories fall into an implicit "suspicious"
+# bucket — treated as acceptable (warning) by default.
+_TYPE_HOME_AFFINITY = {
+    # Facts / preferences / constraints etc. live in LTMEMORY by design.
+    "fact":        ("LTMEMORY.md", {"LTMEMORY.md"},                                    {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "preference":  ("LTMEMORY.md", {"LTMEMORY.md"},                                    {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "constraint":  ("LTMEMORY.md", {"LTMEMORY.md"},                                    {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "commitment":  ("LTMEMORY.md", {"LTMEMORY.md"},                                    {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md"}),
+    "identity":    ("LTMEMORY.md", {"LTMEMORY.md"},                                    {"PLAYBOOKS.md", "EPISODES.md", "WISHES.md"}),
+    "relationship":("LTMEMORY.md", {"LTMEMORY.md"},                                    {"PLAYBOOKS.md", "EPISODES.md", "WISHES.md"}),
+    "lesson":      ("LTMEMORY.md", {"LTMEMORY.md", "PLAYBOOKS.md"},                    {"EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "decision":    ("LTMEMORY.md", {"LTMEMORY.md", "PLAYBOOKS.md"},                    {"EPISODES.md", "WISHES.md"}),
+    "open_question":("LTMEMORY.md", {"LTMEMORY.md"},                                   {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md"}),
+    # Methods / procedures are PLAYBOOKS-native; LTMEMORY is a
+    # noteworthy edge case when the method is more factoid than recipe.
+    "method":      ("PLAYBOOKS.md", {"PLAYBOOKS.md", "LTMEMORY.md"},                   {"EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "procedure":   ("PLAYBOOKS.md", {"PLAYBOOKS.md"},                                  {"LTMEMORY.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    # Episodes are narrative bundles — EPISODES.md only.
+    "episode":     ("EPISODES.md",  {"EPISODES.md"},                                   {"LTMEMORY.md", "PLAYBOOKS.md", "WISHES.md"}),
+    # Milestones are personal-only timeline events; HISTORY.md is the strong home.
+    "milestone":   ("HISTORY.md",   {"HISTORY.md", "EPISODES.md"},                     {"LTMEMORY.md", "PLAYBOOKS.md", "WISHES.md"}),
+    # Aspirations are personal-only wishes; anywhere else is impossible.
+    "aspiration":  ("WISHES.md",    {"WISHES.md"},                                     {"LTMEMORY.md", "PLAYBOOKS.md", "EPISODES.md", "HISTORY.md"}),
+}
+
+
+def classify_type_home_affinity(ctype: str, home: str) -> tuple:
+    """Classify a (type, home) pair per the affinity table.
+
+    Returns ``(state, suggested_home, affinity_score)`` where:
+      - ``state`` ∈ {``"strong"``, ``"acceptable"``, ``"suspicious"``, ``"impossible"``}
+      - ``suggested_home`` is the affinity-strong home for this type, or None.
+      - ``affinity_score`` is a deterministic 0.1/0.5/1.0 scalar useful as a
+        weak ranking signal but not a threshold — suitable for per-claim
+        diagnostic surfaces.
+    """
+    entry = _TYPE_HOME_AFFINITY.get(ctype)
+    if entry is None:
+        # Unknown type — caller handles via VALID_TYPES check, but be safe.
+        return ("suspicious", None, 0.1)
+    strong_home, acceptable, impossible = entry
+    if home in impossible:
+        return ("impossible", strong_home, 0.0)
+    if home == strong_home:
+        return ("strong", None, 1.0)
+    if home in acceptable:
+        return ("acceptable", strong_home, 0.5)
+    return ("suspicious", strong_home, 0.1)
+VALID_STATUSES = {"resolved", "contested", "unresolved", "superseded", "stale", "retire_candidate", "probable_duplicate"}
 INACTIVE_STATUSES = {"superseded", "stale", "retire_candidate"}
 VALID_HOMES = {"LTMEMORY.md", "PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}
 PERSONAL_ONLY_HOMES = {"HISTORY.md", "WISHES.md"}
@@ -47,16 +105,6 @@ MANIFEST_REQUIRED_KEYS = [
 EPISODES_DIGEST_CAP = 500
 
 DEFAULT_CONFIG = Path.home() / ".openclaw" / "memory-purifier" / "memory-purifier.json"
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 def _load_json_safely(path: Path) -> dict:
@@ -138,9 +186,15 @@ def check_manifest(path: Path) -> tuple:
     for k in MANIFEST_REQUIRED_KEYS:
         if k not in manifest:
             errors.append(f"manifest missing required key: {k}")
+    # v1.5.0 Contract 1 — single-sourced from `_lib.statuses`. Validator,
+    # write_manifest argparse choices, and orchestrator CANONICAL_STATUSES
+    # all resolve to the same frozenset; divergence is a contract break.
     status = manifest.get("status")
-    if status not in (None, "ok", "skipped", "partial_failure", "error"):
-        warnings.append(f"manifest.status={status!r} unrecognized (expected ok|skipped|partial_failure|error)")
+    if status is not None and status not in CANONICAL_TOP_LEVEL_STATUS_SET:
+        allowed = "|".join(sorted(CANONICAL_TOP_LEVEL_STATUS_SET))
+        warnings.append(
+            f"manifest.status={status!r} unrecognized (expected {allowed})"
+        )
     prof = manifest.get("profileScope")
     if prof not in (None, "business", "personal", "shared"):
         warnings.append(f"manifest.profileScope={prof!r} unrecognized")
@@ -178,6 +232,21 @@ def check_claims(claims: list, profile: str) -> tuple:
             errors.append(f"{prefix} id={cid} primaryHome={home!r} not in valid set")
         elif home in PERSONAL_ONLY_HOMES and profile != "personal":
             errors.append(f"{prefix} id={cid} primaryHome={home!r} only allowed on personal profile (got {profile!r})")
+        else:
+            # v1.5.0 B3: type-home affinity check. impossible → hard error;
+            # acceptable/suspicious → warning with suggested home.
+            if ctype in VALID_TYPES:
+                route_state, suggested_home, _score = classify_type_home_affinity(ctype, home)
+                if route_state == "impossible":
+                    errors.append(
+                        f"{prefix} id={cid} type={ctype!r}+primaryHome={home!r}: "
+                        f"type-home pairing forbidden; expected {suggested_home}"
+                    )
+                elif route_state in ("acceptable", "suspicious"):
+                    warnings.append(
+                        f"{prefix} id={cid} type={ctype!r}+primaryHome={home!r}: "
+                        f"route affinity={route_state!r}, suggested home {suggested_home!r}"
+                    )
 
         prof_scope = c.get("profileScope")
         if prof_scope not in (None, "business", "personal", "shared"):
@@ -309,6 +378,13 @@ def main() -> int:
     ap.add_argument("--profile", choices=["business", "personal"], help="Profile for view eligibility checks")
     ap.add_argument("--config", help=f"Path to memory-purifier.json (default: {DEFAULT_CONFIG})")
     ap.add_argument("--timezone", help="IANA timezone name")
+    ap.add_argument(
+        "--target-dir",
+        help="Override for the validation target directory (v1.5.0 A2). Default = --runtime-dir "
+             "for artifacts and --workspace for views (back-compat). When set to a staging path, "
+             "both artifacts AND views are read from that single staging dir — used by the "
+             "transactional commit pipeline to validate staged output BEFORE promotion.",
+    )
 
     args = ap.parse_args()
 
@@ -327,27 +403,37 @@ def main() -> int:
     workspace = Path(workspace_hint).expanduser() if workspace_hint else (Path.home() / ".openclaw" / "workspace")
     runtime_dir = Path(args.runtime_dir).expanduser() if args.runtime_dir else (workspace / "runtime")
 
+    # v1.5.0 A2: when the orchestrator stages outputs, artifacts + views
+    # both live under one staging dir; point everything there.
+    if args.target_dir:
+        target = Path(args.target_dir).expanduser()
+        artifact_dir = target
+        view_dir = target
+    else:
+        artifact_dir = runtime_dir
+        view_dir = workspace
+
     errors: list = []
     warnings: list = []
 
-    fe, fw = check_files_exist(runtime_dir, workspace, profile)
+    fe, fw = check_files_exist(artifact_dir, view_dir, profile)
     errors.extend(fe); warnings.extend(fw)
 
-    claims_path = runtime_dir / "purified-claims.jsonl"
+    claims_path = artifact_dir / "purified-claims.jsonl"
     claims, parse_errors = _load_jsonl(claims_path)
     for pe in parse_errors:
         errors.append(pe)
 
-    me, mw = check_manifest(runtime_dir / "purified-manifest.json")
+    me, mw = check_manifest(artifact_dir / "purified-manifest.json")
     errors.extend(me); warnings.extend(mw)
 
     ce, cw = check_claims(claims, profile)
     errors.extend(ce); warnings.extend(cw)
 
-    re_, rw = check_routes(runtime_dir / "purified-routes.json", claims)
+    re_, rw = check_routes(artifact_dir / "purified-routes.json", claims)
     errors.extend(re_); warnings.extend(rw)
 
-    ve, vw = check_markdown_view_presence(workspace, claims, profile)
+    ve, vw = check_markdown_view_presence(view_dir, claims, profile)
     errors.extend(ve); warnings.extend(vw)
 
     if errors:

@@ -145,7 +145,7 @@ No prompt templating, no variable substitution, no prompt-side path resolution.
       "claim_id": "<hash>",
       "text": "<canonical text>",
       "type": "<type>",
-      "status": "resolved | contested | unresolved | superseded | stale | retire_candidate",
+      "status": "resolved | contested | unresolved | superseded | stale | retire_candidate | probable_duplicate",
       "primary_home": "<filename>",
       "provenance": [{"source": "...", "line_span": [n, m], "captured_at": "..."}],
       "updated_at": "<iso>"
@@ -201,7 +201,7 @@ No prompt templating, no variable substitution, no prompt-side path resolution.
 ### 5.4 Enums
 
 - `type` ∈ `{fact, lesson, decision, commitment, constraint, preference, identity, relationship, method, procedure, episode, aspiration, milestone, open_question}`.
-- `status` ∈ `{resolved, contested, unresolved, superseded, stale, retire_candidate}`. Pass 2 emits `resolved`, `contested`, `unresolved`, `superseded`, or `stale`; `retire_candidate` is added by `assemble_artifacts.py` when all of a claim's source provenance entries reference files that have been removed from the workspace (see §5.8).
+- `status` ∈ `{resolved, contested, unresolved, superseded, stale, retire_candidate, probable_duplicate}`. Pass 2 emits `resolved`, `contested`, `unresolved`, `superseded`, or `stale`; `retire_candidate` is added by `assemble_artifacts.py` when all of a claim's source provenance entries reference files that have been removed from the workspace (see §5.8); `probable_duplicate` is added by `assemble_artifacts.py` when the graded-similarity check flags a borderline paraphrase match to an existing active claim (v1.5.0 B2 — Contract 4; see §5.9).
 - `primary_home` ∈ `{LTMEMORY.md, PLAYBOOKS.md, EPISODES.md, HISTORY.md, WISHES.md}`. Personal-only gate applies to `HISTORY.md` / `WISHES.md`.
 
 ### 5.5 Validator checks (enforced by `score_purifier.py`)

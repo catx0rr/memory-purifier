@@ -155,3 +155,69 @@ For each claim in `purified-claims.jsonl`:
 - [ ] `secondary_tags` does not contain the same filename as `primaryHome` (would be redundant)
 
 Violations produce manifest `warnings[]` with the offending `claim_id` and a human-readable message.
+
+---
+
+## 8. Affinity levels (v1.5.0 B3 — Contract 4 §37–39)
+
+The validator classifies every `(type, primaryHome)` pair against a deterministic affinity table. The classification outcome shapes both validator behavior and the per-claim diagnostic fields embedded in `purified-claims.jsonl`.
+
+### Four levels
+
+| Level | Meaning | Validator behavior |
+|---|---|---|
+| `strong` | Semantically expected pair | silent (no warning, no error) |
+| `acceptable` | Plausible edge case | manifest warning |
+| `suspicious` | Unknown type OR home outside strong/acceptable/impossible | manifest warning |
+| `impossible` | Forbidden pair (semantic contradiction) | **hard error** — claim rejected |
+
+### Affinity table
+
+| Type | Strong home | Acceptable (warning-level) | Impossible (hard-fail) |
+|---|---|---|---|
+| `fact` | `LTMEMORY.md` | — | `PLAYBOOKS.md`, `EPISODES.md`, `HISTORY.md`, `WISHES.md` |
+| `preference` | `LTMEMORY.md` | — | `PLAYBOOKS.md`, `EPISODES.md`, `HISTORY.md`, `WISHES.md` |
+| `constraint` | `LTMEMORY.md` | — | `PLAYBOOKS.md`, `EPISODES.md`, `HISTORY.md`, `WISHES.md` |
+| `commitment` | `LTMEMORY.md` | — | `PLAYBOOKS.md`, `EPISODES.md`, `HISTORY.md` |
+| `identity` | `LTMEMORY.md` | — | `PLAYBOOKS.md`, `EPISODES.md`, `WISHES.md` |
+| `relationship` | `LTMEMORY.md` | — | `PLAYBOOKS.md`, `EPISODES.md`, `WISHES.md` |
+| `lesson` | `LTMEMORY.md` | `PLAYBOOKS.md` | `EPISODES.md`, `HISTORY.md`, `WISHES.md` |
+| `decision` | `LTMEMORY.md` | `PLAYBOOKS.md` | `EPISODES.md`, `WISHES.md` |
+| `open_question` | `LTMEMORY.md` | — | `PLAYBOOKS.md`, `EPISODES.md`, `HISTORY.md` |
+| `method` | `PLAYBOOKS.md` | `LTMEMORY.md` | `EPISODES.md`, `HISTORY.md`, `WISHES.md` |
+| `procedure` | `PLAYBOOKS.md` | — | `LTMEMORY.md`, `EPISODES.md`, `HISTORY.md`, `WISHES.md` |
+| `episode` | `EPISODES.md` | — | `LTMEMORY.md`, `PLAYBOOKS.md`, `WISHES.md` |
+| `milestone` | `HISTORY.md` | `EPISODES.md` | `LTMEMORY.md`, `PLAYBOOKS.md`, `WISHES.md` |
+| `aspiration` | `WISHES.md` | — | `LTMEMORY.md`, `PLAYBOOKS.md`, `EPISODES.md`, `HISTORY.md` |
+
+A home not listed in any of the three columns for a given type defaults to `suspicious` (warning).
+
+### Per-claim diagnostic fields
+
+Every record in `purified-claims.jsonl` carries:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `routeValidationState` | `strong` / `acceptable` / `suspicious` / `impossible` | outcome of the affinity check |
+| `routeAffinityScore` | `1.0` / `0.5` / `0.1` / `0.0` | numeric tier indicator (debug ranking aid, not a threshold) |
+| `routeSuggestedHome` | home filename / `null` | `null` on `strong`; suggested `strong_home` on any other state |
+
+### Per-run diagnostic field
+
+`purified-manifest.json` carries `routeValidationWarnings[]` — one entry per claim whose `routeValidationState != "strong"`:
+
+```json
+{
+  "claim_id": "cl-abc123",
+  "chosen_home": "LTMEMORY.md",
+  "suggested_home": "PLAYBOOKS.md",
+  "type": "method",
+  "state": "acceptable"
+}
+```
+
+Empty list means every claim landed at its strong home.
+
+### Important boundary
+
+Affinity validation is route sanity, not final reconciliation. Impossible pairs are blocked; suspicious pairs are surfaced but the claim is still persisted so wiki reconciler has visibility. Purifier does not invent homes or re-route claims — it only validates the `(type, home)` pair Pass 2 emitted.

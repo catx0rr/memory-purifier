@@ -18,20 +18,14 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
 
 
 def _stable_claim_id(canonical: dict) -> str:
@@ -204,6 +198,191 @@ def _semantic_reuse_match(canonical: dict, prior_claims: list) -> str:
     return matches[0].get("id")
 
 
+# v1.5.0 B2 (Contract 4) — probable-duplicate detection constants.
+#
+# Graded similarity fires only AFTER ``_semantic_reuse_match`` returns None
+# (no exact normalized-triple match). The realistic case this catches is
+# paraphrase drift: same subject + same home + strong text overlap + a
+# predicate that differs even after normalization (e.g., "moves" vs
+# "relocates"). Weights balance so that case hits 0.80 when text-Jaccard
+# is high and falls below when text overlap is weak — exactly the
+# "uncertain enough to flag, clear enough to keep the new claim" zone.
+#
+# Wiki reconciler owns final collapse; purifier only surfaces the
+# candidate pair for downstream attention.
+_PROBABLE_DUP_THRESHOLD = 0.80
+_PROBABLE_DUP_WEIGHT_SUBJECT = 0.4
+_PROBABLE_DUP_WEIGHT_PREDICATE = 0.2
+_PROBABLE_DUP_WEIGHT_HOME = 0.2
+_PROBABLE_DUP_WEIGHT_TEXT = 0.2
+# Object-match bonus (Contract 4 §33): applied ONLY when both sides carry a
+# non-empty, normalized-matching object. Pushes borderline matches clearly
+# over threshold when structured object match is present.
+_PROBABLE_DUP_OBJECT_BONUS = 0.1
+
+# Stopwords filtered out of text-Jaccard to keep the signal about content,
+# not function words. Kept tight to avoid over-eager duplicate collapse on
+# short claim texts.
+_DUP_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "be", "been",
+    "to", "of", "and", "or", "in", "on", "at", "for", "with", "by",
+    "this", "that", "it", "as", "from",
+})
+
+_DUP_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _dup_tokens(text: str) -> set:
+    """Lowercase word tokens with stopword filter — for text-Jaccard."""
+    if not text:
+        return set()
+    return {t for t in _DUP_TOKEN_RE.findall(str(text).lower()) if t not in _DUP_STOPWORDS}
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    union = a | b
+    return (len(a & b) / len(union)) if union else 0.0
+
+
+def _probable_duplicate_match(canonical: dict, prior_claims: list) -> dict | None:
+    """Graded similarity check beyond exact normalized-triple match.
+
+    Scope rule (strict order per Contract 4):
+      1. Same primary_home first — cross-home priors are skipped.
+      2. Normalize subject + predicate.
+      3. Normalize object/value when present on both (Contract 4 §scope-order).
+         A matching object is a strong duplicate signal; its absence on
+         either side contributes nothing (neutral, not penalty).
+      4. Compute composite score; return best match above threshold.
+
+    Returns ``{"claim_id", "score", "dominant_signal"}`` on match, else None.
+    ``dominant_signal`` is the largest-weighted signal in this specific
+    scoring — useful for the ``duplicateReason`` metadata field.
+    """
+    canonical_home = _normalize_home(canonical.get("primary_home"))
+    canonical_subject = _normalize_subject(canonical.get("subject") or "")
+    canonical_predicate = _normalize_predicate(canonical.get("predicate") or "")
+    canonical_object = _normalize_subject(canonical.get("object") or "")  # subject rules work for objects
+    canonical_text = str(canonical.get("text") or "")
+    canonical_text_tokens = _dup_tokens(canonical_text)
+
+    if not canonical_home or not canonical_subject or not canonical_predicate:
+        return None
+
+    best_score = 0.0
+    best_prior = None
+    best_signal = ""
+
+    for prior in prior_claims:
+        # Skip inactive priors so resurrected/retired claims don't steal new ids.
+        if prior.get("status") in {"superseded", "retire_candidate", "stale"}:
+            continue
+        prior_home = _normalize_home(prior.get("primaryHome"))
+        if prior_home != canonical_home:
+            continue  # home gate
+
+        prior_subject = _normalize_subject(prior.get("subject") or "")
+        prior_predicate = _normalize_predicate(prior.get("predicate") or "")
+        prior_object = _normalize_subject(prior.get("object") or "")
+        prior_text = str(prior.get("text") or "")
+
+        subject_score = 1.0 if prior_subject == canonical_subject else 0.0
+        predicate_score = 1.0 if prior_predicate == canonical_predicate else 0.0
+        home_score = 1.0  # already gated; always 1.0 past the gate
+        text_score = _jaccard(canonical_text_tokens, _dup_tokens(prior_text))
+
+        # v1.5.0 object-match bonus (Contract 4 §33): only applies when BOTH
+        # sides carry a non-empty object. Neutral otherwise so the absence
+        # of structured objects doesn't suppress legitimate duplicates.
+        object_bonus = 0.0
+        if canonical_object and prior_object and canonical_object == prior_object:
+            object_bonus = _PROBABLE_DUP_OBJECT_BONUS
+
+        composite = (
+            subject_score * _PROBABLE_DUP_WEIGHT_SUBJECT
+            + predicate_score * _PROBABLE_DUP_WEIGHT_PREDICATE
+            + home_score * _PROBABLE_DUP_WEIGHT_HOME
+            + text_score * _PROBABLE_DUP_WEIGHT_TEXT
+            + object_bonus
+        )
+
+        if composite >= _PROBABLE_DUP_THRESHOLD and composite > best_score:
+            best_score = composite
+            best_prior = prior
+            # Identify which signal contributed most — supports operator
+            # inspection via the duplicateReason metadata field.
+            signals = [
+                ("subject", subject_score * _PROBABLE_DUP_WEIGHT_SUBJECT),
+                ("predicate", predicate_score * _PROBABLE_DUP_WEIGHT_PREDICATE),
+                ("home", home_score * _PROBABLE_DUP_WEIGHT_HOME),
+                ("text", text_score * _PROBABLE_DUP_WEIGHT_TEXT),
+            ]
+            signals.sort(key=lambda x: -x[1])
+            best_signal = signals[0][0]
+
+    if best_prior is None:
+        return None
+    return {
+        "claim_id": best_prior.get("id"),
+        "score": round(best_score, 3),
+        "dominant_signal": best_signal,
+    }
+
+
+def _normalization_signature(canonical: dict) -> str:
+    """Stable string fingerprint of the normalized reuse key — debug aid."""
+    subj, pred, home = _normalize_reuse_key(
+        canonical.get("subject"),
+        canonical.get("predicate"),
+        canonical.get("primary_home"),
+    )
+    return f"{subj}|{pred}|{home}"
+
+
+# v1.5.0 B3 — type→home affinity table for per-claim diagnostic fields.
+# Kept in sync with ``validate_outputs._TYPE_HOME_AFFINITY`` (same data).
+# Duplicated locally so ``assemble_artifacts`` can emit the diagnostic
+# fields without pulling validate_outputs as a runtime dependency.
+_ROUTE_AFFINITY = {
+    "fact":         ("LTMEMORY.md", {"LTMEMORY.md"},                     {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "preference":   ("LTMEMORY.md", {"LTMEMORY.md"},                     {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "constraint":   ("LTMEMORY.md", {"LTMEMORY.md"},                     {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "commitment":   ("LTMEMORY.md", {"LTMEMORY.md"},                     {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md"}),
+    "identity":     ("LTMEMORY.md", {"LTMEMORY.md"},                     {"PLAYBOOKS.md", "EPISODES.md", "WISHES.md"}),
+    "relationship": ("LTMEMORY.md", {"LTMEMORY.md"},                     {"PLAYBOOKS.md", "EPISODES.md", "WISHES.md"}),
+    "lesson":       ("LTMEMORY.md", {"LTMEMORY.md", "PLAYBOOKS.md"},     {"EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "decision":     ("LTMEMORY.md", {"LTMEMORY.md", "PLAYBOOKS.md"},     {"EPISODES.md", "WISHES.md"}),
+    "open_question":("LTMEMORY.md", {"LTMEMORY.md"},                     {"PLAYBOOKS.md", "EPISODES.md", "HISTORY.md"}),
+    "method":       ("PLAYBOOKS.md", {"PLAYBOOKS.md", "LTMEMORY.md"},    {"EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "procedure":    ("PLAYBOOKS.md", {"PLAYBOOKS.md"},                   {"LTMEMORY.md", "EPISODES.md", "HISTORY.md", "WISHES.md"}),
+    "episode":      ("EPISODES.md",  {"EPISODES.md"},                    {"LTMEMORY.md", "PLAYBOOKS.md", "WISHES.md"}),
+    "milestone":    ("HISTORY.md",   {"HISTORY.md", "EPISODES.md"},      {"LTMEMORY.md", "PLAYBOOKS.md", "WISHES.md"}),
+    "aspiration":   ("WISHES.md",    {"WISHES.md"},                      {"LTMEMORY.md", "PLAYBOOKS.md", "EPISODES.md", "HISTORY.md"}),
+}
+
+
+def _route_diagnostics(ctype: str, home: str) -> dict:
+    """Classify a claim's route affinity and return diagnostic fields.
+
+    Returns a dict with ``routeValidationState``, ``routeAffinityScore``,
+    and ``routeSuggestedHome``. Embedded in each persisted claim so
+    operators can inspect route quality without rerunning the validator.
+    """
+    entry = _ROUTE_AFFINITY.get(ctype)
+    if entry is None:
+        return {"routeValidationState": "suspicious", "routeAffinityScore": 0.1, "routeSuggestedHome": None}
+    strong_home, acceptable, impossible = entry
+    if home in impossible:
+        return {"routeValidationState": "impossible", "routeAffinityScore": 0.0, "routeSuggestedHome": strong_home}
+    if home == strong_home:
+        return {"routeValidationState": "strong", "routeAffinityScore": 1.0, "routeSuggestedHome": None}
+    if home in acceptable:
+        return {"routeValidationState": "acceptable", "routeAffinityScore": 0.5, "routeSuggestedHome": strong_home}
+    return {"routeValidationState": "suspicious", "routeAffinityScore": 0.1, "routeSuggestedHome": strong_home}
+
+
 def _validate_supersession_chain(new_claims: list, prior_claims: list) -> list:
     """Script-level cross-check: when a new claim's `supersedes` list
     targets a prior that is already itself superseded, surface a warning.
@@ -237,24 +416,67 @@ def translate_claim(
     ts: dict,
     prior_claims: list = None,
 ) -> dict:
+    """Translate a Pass-2 snake_case claim into the persisted camelCase shape.
+
+    v1.5.0 B2 (Contract 4): every claim now carries the full
+    duplicate-disposition metadata:
+      - ``duplicateDisposition`` ∈ {``reuse_existing``, ``probable_duplicate``,
+        ``new_claim``}
+      - ``duplicateTargetClaimId`` — prior id pointed at (populated for
+        reuse_existing and probable_duplicate)
+      - ``duplicateReason`` — short rationale tag for operator inspection
+      - ``normalizationSignature`` — the normalized 3-tuple, debug aid
+    """
     canonical = claim_snake.get("canonical", {}) or {}
     claim_id = claim_snake.get("claim_id")
+
+    # Disposition + target computed once, used for both id assignment and
+    # metadata emission.
+    disposition = "new_claim"
+    duplicate_target = None
+    duplicate_reason = None
+    status_override = None
+    priors = prior_claims or []
+
     if claim_id == "<new>" or not claim_id:
-        # Semantic reuse: if (subject, predicate, primary_home) matches a prior
-        # active claim, reuse that claim's id. This lets reworded text update
-        # the same canonical unit instead of minting a new id that misses the
-        # supersession chain. Falls back to stable hash when no match.
-        reused = _semantic_reuse_match(canonical, prior_claims or [])
-        claim_id = reused or _stable_claim_id(canonical)
+        reused = _semantic_reuse_match(canonical, priors)
+        if reused:
+            disposition = "reuse_existing"
+            duplicate_target = reused
+            duplicate_reason = "exact_normalized_match"
+            claim_id = reused
+        else:
+            # No exact match — check for probable duplicate.
+            dup = _probable_duplicate_match(canonical, priors)
+            if dup:
+                disposition = "probable_duplicate"
+                duplicate_target = dup["claim_id"]
+                duplicate_reason = (
+                    f"composite_{dup['score']:.2f}_{dup['dominant_signal']}"
+                )
+                # Pass 2 owns status choice, but probable_duplicate is
+                # load-bearing metadata for downstream consumers; override
+                # the status to make the flag visible on-disk.
+                status_override = "probable_duplicate"
+                claim_id = _stable_claim_id(canonical)
+            else:
+                disposition = "new_claim"
+                duplicate_reason = "no_candidates_above_threshold"
+                claim_id = _stable_claim_id(canonical)
 
     provenance_camel = _translate_provenance(claim_snake.get("provenance", []))
     cross_surface_support = sorted({p["source"] for p in provenance_camel if p.get("source")})
+
+    final_status = status_override or canonical.get("status")
+
+    # v1.5.0 B3: per-claim route diagnostic fields (state + score + suggestion).
+    route_diag = _route_diagnostics(canonical.get("type"), canonical.get("primary_home"))
 
     return {
         "id": claim_id,
         "sourceClusterId": claim_snake.get("source_cluster_id"),
         "type": canonical.get("type"),
-        "status": canonical.get("status"),
+        "status": final_status,
         "text": canonical.get("text"),
         "subject": canonical.get("subject"),
         "predicate": canonical.get("predicate"),
@@ -273,6 +495,15 @@ def translate_claim(
         "confidencePosture": claim_snake.get("confidence_posture"),
         "rationale": claim_snake.get("rationale"),
         "routeRationale": claim_snake.get("route_rationale"),
+        # v1.5.0 B2 duplicate-disposition metadata:
+        "duplicateDisposition": disposition,
+        "duplicateTargetClaimId": duplicate_target,
+        "duplicateReason": duplicate_reason,
+        "normalizationSignature": _normalization_signature(canonical),
+        # v1.5.0 B3 route-diagnostic fields:
+        "routeValidationState": route_diag["routeValidationState"],
+        "routeAffinityScore": route_diag["routeAffinityScore"],
+        "routeSuggestedHome": route_diag["routeSuggestedHome"],
         "updatedInRunId": run_id,
         "updatedAt": ts["timestamp"],
         "updatedAt_utc": ts["timestamp_utc"],
@@ -296,22 +527,19 @@ def load_jsonl(path: Path) -> list:
     return out
 
 
+# v1.5.0 audit-corrective: atomic writers now delegate to ``_lib/fs.py``
+# so fsync/temp-sibling improvements land consistently. Keep the local
+# name alias so existing call sites inside this script don't churn.
+from _lib.fs import atomic_write_json as _lib_atomic_write_json  # noqa: E402
+from _lib.fs import atomic_write_jsonl as _lib_atomic_write_jsonl  # noqa: E402
+
+
 def atomic_write_jsonl(path: Path, records: list) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-    with tmp.open("w", encoding="utf-8") as f:
-        for r in records:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    os.replace(tmp, path)
+    _lib_atomic_write_jsonl(path, records)
 
 
 def atomic_write_json(path: Path, obj) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    _lib_atomic_write_json(path, obj)
 
 
 def merge_claims(prior_claims: list, new_claims: list, run_id: str) -> list:
@@ -475,6 +703,20 @@ def main() -> int:
         help='JSON array of source paths that were present in the prior run\'s sourceInventory but are absent now. '
              'Claims whose provenance depends ONLY on these sources are marked status="retire_candidate".',
     )
+    ap.add_argument(
+        "--run-id",
+        help="Explicit run_id. Overrides the id derived from --pass2 and the synthetic "
+             "`sweep-<uuid>` fallback used on stale-only sweeps. Lets stale-sweep inherit "
+             "the orchestrator's run_id for end-to-end lineage (v1.5.0 D2).",
+    )
+    ap.add_argument(
+        "--output-dir",
+        help="Override for the artifact output directory (v1.5.0 A2). Default = --runtime-dir "
+             "(back-compat for standalone invocations). When set to a staging path, the "
+             "four machine artifacts (claims.jsonl, contradictions.jsonl, entities.json, "
+             "routes.json) are written there instead of the final runtime dir. Prior claims "
+             "are still read from the runtime dir.",
+    )
     ap.add_argument("--dry-run", action="store_true", help="Translate + merge; do not write any files")
 
     args = ap.parse_args()
@@ -523,7 +765,9 @@ def main() -> int:
             print(json.dumps(out, indent=2, ensure_ascii=False))
             return 0
 
-    run_id = (pass2 or {}).get("run_id") or f"sweep-{uuid.uuid4().hex[:12]}"
+    # v1.5.0 D2: explicit --run-id wins, then pass2-derived, then synthetic fallback
+    # (the fallback is preserved for standalone invocations without an orchestrator).
+    run_id = args.run_id or (pass2 or {}).get("run_id") or f"sweep-{uuid.uuid4().hex[:12]}"
     profile_scope = (pass2 or {}).get("profile_scope") or "business"
     mode = (pass2 or {}).get("mode") or "incremental"
     canonical_claims_snake = (pass2 or {}).get("canonical_claims") or []
@@ -536,13 +780,21 @@ def main() -> int:
     workspace = Path(workspace_hint).expanduser() if workspace_hint else (Path.home() / ".openclaw" / "workspace")
     runtime_dir = Path(args.runtime_dir).expanduser() if args.runtime_dir else (workspace / "runtime")
 
-    claims_path = runtime_dir / "purified-claims.jsonl"
-    contras_path = runtime_dir / "purified-contradictions.jsonl"
-    entities_path = runtime_dir / "purified-entities.json"
-    routes_path = runtime_dir / "purified-routes.json"
+    # Prior claims ARE still read from the runtime dir — the most-recently
+    # committed state is always there. Only the write target flips to
+    # `output_dir` when A2 staging is active.
+    prior_claims_path = runtime_dir / "purified-claims.jsonl"
+    prior_contras_path = runtime_dir / "purified-contradictions.jsonl"
 
-    prior_claims = load_jsonl(claims_path)
-    prior_contras = load_jsonl(contras_path)
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else runtime_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    claims_path = output_dir / "purified-claims.jsonl"
+    contras_path = output_dir / "purified-contradictions.jsonl"
+    entities_path = output_dir / "purified-entities.json"
+    routes_path = output_dir / "purified-routes.json"
+
+    prior_claims = load_jsonl(prior_claims_path)
+    prior_contras = load_jsonl(prior_contras_path)
     # Translate with prior_claims in scope so semantic-reuse matching can fire.
     new_claims = [translate_claim(c, run_id, profile_scope, ts, prior_claims=prior_claims) for c in canonical_claims_snake]
 

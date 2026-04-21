@@ -420,7 +420,7 @@ seed_config() {
 
     cat > "$CONFIG_FILE" <<CFGEOF
 {
-  "version": "1.4.0",
+  "version": "1.5.0",
   "profile": "$profile",
   "timezone": "$CRON_TZ",
   "cadence": {
@@ -498,7 +498,7 @@ INSTALL_TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 seed_json_if_absent "$RUNTIME_DIR/purifier-metadata.json" "$(cat <<METAEOF
 {
-  "version": "1.4.0",
+  "version": "1.5.0",
   "installed_at": "$INSTALL_TS_LOCAL",
   "installed_at_utc": "$INSTALL_TS_UTC",
   "timezone": "$CRON_TZ",
@@ -507,9 +507,18 @@ seed_json_if_absent "$RUNTIME_DIR/purifier-metadata.json" "$(cat <<METAEOF
 METAEOF
 )"
 
+# v1.5.0 C1 (Contract 3): seed the four-version block so fresh installs
+# start at current logic/schema state — no upgrade detection needed on
+# first cron fire. The orchestrator overwrites these on every successful
+# finalize; the seed only matters until the first ok run lands.
 seed_json_if_absent "$RUNTIME_DIR/purified-manifest.json" "$(cat <<MANIEOF
 {
-  "version": "1.4.0",
+  "version": "1.5.0",
+  "packageVersion": "1.5.0",
+  "logicVersion": "1.5.0",
+  "manifestSchemaVersion": "1",
+  "artifactSchemaVersion": "1",
+  "lastSuccessfulLogicVersion": "1.5.0",
   "runId": null,
   "mode": null,
   "startedAt": null,

@@ -352,6 +352,66 @@ git pull --ff-only
 bash install.sh  # idempotent; preserves existing config unless --force-config is passed
 ```
 
+### Upgrading from v1.4.0 to v1.5.0
+
+v1.5.0 changes semantic behavior in ways that would invalidate prior v1.4.0 artifact state if silently mixed (adaptive prior-claim widening, probable-duplicate detection, type-home affinity validation, transactional stage-then-promote publish). The purifier enforces a **refuse-and-lock** upgrade gate to prevent that mixing.
+
+**What happens automatically:**
+
+1. After `git pull` + `bash install.sh`, the next cron fire reads your existing `purified-manifest.json`, sees `logicVersion: "1.4.0"` (or missing), and **refuses the run**:
+   - Writes `<runtime>/locks/purifier-upgrade-pending-1.4.0-1.5.0.json` — lock file carrying `from`, `to`, `reason`, and unblock instructions.
+   - Prints operator-facing `[purifier] UPGRADE REQUIRED` text to stderr.
+   - Emits final JSON to stdout with `status: "upgrade_required"`, `upgradeRequired: true`, `requiresForcedReconciliation: true`.
+   - Exits with code 2.
+2. No staging dir is created. No semantic passes run. No artifacts are touched. No downstream wiki signal fires.
+3. Every subsequent cron fire re-detects the mismatch and blocks the same way.
+
+**How to clear the block (one-time operator action):**
+
+```bash
+python3 scripts/run_purifier.py --acknowledge-upgrade
+```
+
+That single invocation:
+
+- Clears the upgrade-pending lock.
+- **Forces `mode=reconciliation`** for this run regardless of your default cadence.
+- Runs the full pipeline under v1.5.0 semantics.
+- Writes the new four-version block on success: `logicVersion=1.5.0`, `manifestSchemaVersion=1`, `artifactSchemaVersion=1`, `lastSuccessfulLogicVersion=1.5.0`.
+- Emits an `upgrade_acknowledged` warning in `manifest.warnings[]` for audit.
+- Future cron fires resume normally under v1.5.0 logic.
+
+**Expected cost:** reconciliation mode reads every consolidated input and re-ranks the full prior-claim pool. On a typical install expect 1–3 minutes.
+
+**If `--acknowledge-upgrade` itself fails:** the lock is NOT cleared (it's only cleared on `ok` finalize). Fix the underlying issue (inspect `<runtime>/locks/purifier-failed-*-<run_id>.json`) and re-run `--acknowledge-upgrade`.
+
+**Debug retention during the upgrade run:**
+
+```bash
+python3 scripts/run_purifier.py --acknowledge-upgrade --keep-staging
+# or:
+PURIFIER_DEBUG_RETAIN=1 python3 scripts/run_purifier.py --acknowledge-upgrade
+```
+
+Either preserves the staging dir on `ok` so you can inspect what got staged and what would have been promoted.
+
+### Final-status taxonomy (v1.5.0)
+
+Every `run_purifier.py` invocation reports exactly one of these top-level statuses (Contract 1):
+
+| Status | Publish? | Cleanup? |
+|---|---|---|
+| `ok` | ✅ | staging + temps removed; pass-failure records removed |
+| `skipped` | ❌ existing state authoritative | staging + temps removed |
+| `skipped_superseded` | ❌ existing state authoritative | staging + temps removed |
+| `partial_failure` | ❌ suppressed | **staging + pass-failure records preserved** |
+| `failed` | ❌ | **staging + pass-failure records preserved** |
+| `upgrade_required` | ❌ | no staging created; upgrade lock preserved |
+
+The `run-<run_id>.lock` is released on **every** exit path — it never leaks. See the Contract 6 cleanup matrix in [`README.md`](README.md).
+
+---
+
 ## Uninstall
 
 ```bash

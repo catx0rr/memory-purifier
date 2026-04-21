@@ -21,6 +21,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 DEFAULT_CONFIG = Path.home() / ".openclaw" / "memory-purifier" / "memory-purifier.json"
 
@@ -37,16 +40,6 @@ LTMEMORY_SECTIONS = [
     ("Relationships", "relationship", ("subject_asc",)),
     ("Open Questions", "open_question", ("updated_desc",)),
 ]
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 def _load_json_safely(path: Path) -> dict:
@@ -435,6 +428,12 @@ def main() -> int:
     ap.add_argument("--timezone", help="IANA timezone name")
     ap.add_argument("--dry-run", action="store_true", help="Render but do not write files; echo paths in output")
     ap.add_argument("--force-personal", action="store_true", help="Force personal views even on business profile (for debugging)")
+    ap.add_argument(
+        "--output-dir",
+        help="Override for the markdown-view output directory (v1.5.0 A2). Default = --workspace "
+             "(back-compat). When set to a staging path, views are written there instead of the "
+             "workspace root — used by the transactional commit pipeline.",
+    )
 
     args = ap.parse_args()
 
@@ -450,6 +449,11 @@ def main() -> int:
     claims_path = Path(args.claims).expanduser() if args.claims else (runtime_dir / "purified-claims.jsonl")
     claims = load_jsonl(claims_path)
 
+    # v1.5.0 A2: views write to output_dir when the orchestrator stages them;
+    # otherwise default to workspace root (back-compat for standalone runs).
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else workspace
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     views_plan: list = [
         ("LTMEMORY.md", render_ltmemory, True),
         ("PLAYBOOKS.md", render_playbooks, True),
@@ -461,7 +465,7 @@ def main() -> int:
     views_rendered: list = []
     views_skipped: list = []
     for filename, renderer, eligible in views_plan:
-        target = workspace / filename
+        target = output_dir / filename
         if not eligible:
             views_skipped.append({"path": str(target), "reason": f"profile={profile}: personal-only view not eligible"})
             continue

@@ -13,6 +13,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 ALLOWED_SHARED = ["MEMORY.md", "RTMEMORY.md", "PROCEDURES.md"]
 ALLOWED_PERSONAL = ["CHRONICLES.md", "DREAMS.md"]
@@ -38,16 +41,6 @@ DENIED_DIR_PREFIXES = (
 
 DEFAULT_CONFIG = Path.home() / ".openclaw" / "memory-purifier" / "memory-purifier.json"
 DEFAULT_REFLECTIONS_CONFIG = Path.home() / ".openclaw" / "reflections" / "reflections.json"
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 def resolve_workspace(cli_arg: str, config_path: Path = None) -> Path:
@@ -96,7 +89,9 @@ def resolve_profile(cli_arg: str, config_path: Path) -> str:
     return "personal"
 
 
-def resolve_timezone(config_path: Path) -> str:
+def resolve_timezone(cli_arg: str | None, config_path: Path) -> str:
+    if cli_arg:
+        return cli_arg
     if config_path.is_file():
         cfg = _load_json_safely(config_path)
         tz = cfg.get("timezone")
@@ -185,13 +180,14 @@ def main() -> int:
         help="Extra path to validate against deny-list (may be repeated)",
     )
     ap.add_argument("--dry-run", action="store_true", help="No effect on discovery (always read-only); echoed in output for chain compatibility")
+    ap.add_argument("--timezone", help="IANA timezone (overrides config). Used for emitted timestamp labels only.")
 
     args = ap.parse_args()
 
     config_path = Path(args.config).expanduser() if args.config else DEFAULT_CONFIG
     workspace = resolve_workspace(args.workspace, config_path)
     profile = resolve_profile(args.profile, config_path)
-    tz_name = resolve_timezone(config_path)
+    tz_name = resolve_timezone(args.timezone, config_path)
 
     if not workspace.is_dir():
         out = {

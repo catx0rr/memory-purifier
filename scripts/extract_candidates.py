@@ -15,6 +15,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _lib.time_utils import timestamp_triple  # noqa: E402
+
 
 TYPE_HINTS_BY_SOURCE = {
     "MEMORY.md": "fact",
@@ -39,16 +42,6 @@ def _is_heading_only(body: str) -> bool:
     if not lines:
         return True
     return all(ln.startswith("#") for ln in lines)
-
-
-def timestamp_triple(tz_name: str = "Asia/Manila") -> dict:
-    now_local = datetime.now().astimezone()
-    now_utc = now_local.astimezone(timezone.utc)
-    return {
-        "timestamp": now_local.isoformat(),
-        "timestamp_utc": now_utc.isoformat().replace("+00:00", "Z"),
-        "timezone": tz_name,
-    }
 
 
 def _file_captured_at(path: Path) -> str:

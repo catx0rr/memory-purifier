@@ -1,9 +1,12 @@
 """F: downstream metric correctness — claimCount must use real claim count, not source count."""
 
 import json
+import sys
 import unittest
+from pathlib import Path
 
-from _helpers import build_fixtures, cleanup_sandbox, make_sandbox, run_installer, run_pipeline, write_source
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers import build_fixtures, cleanup_sandbox, make_sandbox, run_installer, run_pipeline, write_source  # noqa: E402
 
 
 class TestDownstreamMetric(unittest.TestCase):

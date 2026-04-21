@@ -6,9 +6,12 @@ that `manifest.warnings[]` picks up the chain-warning entry.
 """
 
 import json
+import sys
 import unittest
+from pathlib import Path
 
-from _helpers import build_fixtures, cleanup_sandbox, make_sandbox, run_installer, run_pipeline, write_source
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers import build_fixtures, cleanup_sandbox, make_sandbox, run_installer, run_pipeline, write_source  # noqa: E402
 
 
 class TestSupersessionChainWarning(unittest.TestCase):

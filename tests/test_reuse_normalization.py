@@ -9,9 +9,12 @@ Scenarios:
 - Leading article: subject "cat" -> "the cat"
 """
 
+import sys
 import unittest
+from pathlib import Path
 
-from _helpers import build_fixtures, cleanup_sandbox, load_claims, make_sandbox, run_installer, run_pipeline, write_source
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _helpers import build_fixtures, cleanup_sandbox, load_claims, make_sandbox, run_installer, run_pipeline, write_source  # noqa: E402
 
 
 _DEFAULT_SCORES = {

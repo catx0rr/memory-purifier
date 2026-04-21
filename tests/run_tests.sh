@@ -1,10 +1,23 @@
 #!/usr/bin/env bash
-# memory-purifier regression suite.
+# memory-purifier v1.5.0 release-validation regression suite.
 #
-# Runs the six unittest files under `tests/` using the python3 `unittest`
-# module. Each test provisions a disposable workspace under /tmp, installs
-# the package skeleton there, and runs real `run_purifier.py` subprocesses
-# against the file-backed LLM fixture (no API calls).
+# Runs every `test_*.py` under `tests/` via `unittest discover`. Each test
+# provisions a disposable workspace under /tmp, installs the package
+# skeleton, and drives real `run_purifier.py` subprocesses against a
+# file-backed LLM fixture (no API calls; no network).
+#
+# Two supported invocation paths from repo root:
+#
+#   1. Full default suite:
+#        bash tests/run_tests.sh
+#
+#   2. Targeted module:
+#        python3 -m unittest -v tests.test_runtime_v150_proof
+#        python3 -m unittest -v tests.test_publish_contract
+#        ...
+#
+# Both paths exercise the same shipped test tree. No external overlay
+# required.
 
 set -euo pipefail
 

@@ -4,6 +4,60 @@ All notable changes to `memory-purifier` are recorded here in reverse-chronologi
 
 ---
 
+## v1.6.0
+
+Emergency backend-correction patch. Scope: scoring-backend default only — zero purifier architecture changes.
+
+**Problem:** v1.5.0 seeded `prompts.backend = "claude-code"`, which assumed the Claude CLI binary on PATH. memory-purifier lives inside the OpenClaw stack where `openclaw` is the canonical execution path, so Pass 1 / Pass 2 failed before purifier semantics even ran on hosts without the Claude CLI.
+
+**Fix:** Default backend is now `"openclaw"`. All four backends (`openclaw`, `claude-code`, `anthropic-sdk`, `file`) remain supported. Backend preflight runs BEFORE any subprocess invocation, so a missing binary fails with an operator-readable message instead of an opaque mid-retry `FileNotFoundError`.
+
+**Changes:**
+
+- **`scripts/_lib/backend.py`** — NEW. Single-source `DEFAULT_BACKEND = "openclaw"`, `BACKEND_CHOICES = ("openclaw", "claude-code", "anthropic-sdk", "file")`, and `preflight_backend()` which raises `BackendUnavailableError` with an explicit message when the selected backend's prerequisite (binary / SDK / fixture path) is missing.
+- **`scripts/score_promotion.py`** + **`scripts/score_purifier.py`** — both scoring scripts gain:
+  - `openclaw` dispatch case: invokes `openclaw infer model run --prompt <body> --json` (the documented headless-inference surface; see the dispatch contract section below for the full shape and history of the earlier mis-targeted iterations). Override via `MEMORY_PURIFIER_OPENCLAW_CMD` env var for non-standard CLI variants.
+  - argparse `--backend` choices now explicit list via `_lib.backend.BACKEND_CHOICES`.
+  - Preflight hook runs right after backend resolution, before the batching loop.
+  - New diagnostic fields on the output JSON: `backend_model` + `token_usage_source` for operator diagnosis.
+- **`scripts/run_purifier.py`** — emits `backend_deprecated_default` warning in `manifest.warnings[]` when config still carries `"claude-code"` (nudge toward migrating, without silently rewriting the config). Surfaces `backend`, `backendModel`, `tokenUsageSource` on the top-level orchestrator JSON.
+- **`install.sh`** — config seed now `"backend": "openclaw"`. Version strings bumped to `"1.6.0"`.
+- **`references/config-template.md`** — example + field table document `openclaw` as default.
+- **`_lib/version.py`** — `PURIFIER_PACKAGE_VERSION` and `PURIFIER_LOGIC_VERSION` both bumped to `"1.6.0"`. The logic-version bump means existing v1.5.0 installs hit the **refuse-and-lock upgrade gate** (Contract 3) on next cron fire. Operator runs `python3 scripts/run_purifier.py --acknowledge-upgrade` once to clear the lock and force a reconciliation under v1.6.0 semantics.
+
+**Migration policy chosen:** explicit-block-on-missing-binary (not silent auto-migrate of on-disk config). Rationale: silently rewriting an operator's config file is magic; preflight failing with a clear "switch `prompts.backend` to `openclaw` in memory-purifier.json" message is transparent. For installs where the legacy backend's binary IS still available, runs continue and a non-blocking `backend_deprecated_default` warning surfaces in the manifest.
+
+**OpenClaw dispatch contract — documented ``openclaw infer model run`` headless-inference CLI:**
+
+```
+openclaw infer model run \
+  --prompt "<assembled prompt + JSON payload>" \
+  --json \
+  [--model <provider/model>]
+```
+
+Shape notes (all from OpenClaw docs):
+
+- Command path is **`openclaw infer model run`** — the documented headless-inference surface. Stateless by design, correct for batched Pass 1 / Pass 2 scoring where no conversational state is needed.
+- Prompt body is passed via `--prompt`; stdin is NOT the documented input path for this command.
+- `--json` yields a structured envelope; the dispatch parses it and extracts the model response from the first non-empty of `response` / `message` / `content` / `text` / `output` / `result`. If the envelope shape differs (override case, schema drift), raw stdout is used as fallback.
+- `--model <value>` — optional provider/model override. Accepts the `provider/model` form documented by OpenClaw (e.g. `anthropic/claude-opus-4-7`). Appended only when `prompts.model` / `--model` is set. The `prompts.model` config key now also applies to the openclaw backend (in addition to `anthropic-sdk` and `claude-code`).
+- **NOT passed** — agent-surface flags that are not documented on `infer model run`: `--session-id`, `--local`, `--message`, `--timeout`. The outer subprocess timeout continues to apply as a safety.
+
+**Override hatch:** `MEMORY_PURIFIER_OPENCLAW_CMD="<base command>"` replaces the entire base command. Use when the installed `openclaw infer` variant differs from the documented shape.
+
+**Iteration history:**
+
+- **First v1.6.0 iteration** used `openclaw prompt --session isolated --no-deliver` — not a documented OpenClaw command. Wrong.
+- **Second v1.6.0 iteration** used `openclaw agent --local --session-id ... --message ...` — the interactive agent-turn / session surface. Documented but heavier than needed for stateless scoring; correct for interactive agent flows, wrong for headless batched scoring.
+- **Third (current) v1.6.0 iteration** — the above `openclaw infer model run` shape. `infer model run` is the documented headless-inference surface that reuses the agent runtime under the hood while staying stateless for batched scoring. Final for v1.6.0.
+
+**Tests:** 18 new regression tests in `tests/test_backend_v160.py` covering: fresh-install default, backend-choice enum, preflight failures (openclaw missing, claude-code missing, bogus backend, file backend missing fixture), argparse acceptance, legacy-config deprecation warning, no-regression file backend, diagnostic-field emission. Default suite expands from 121 → 139 tests.
+
+**Zero architecture drift:** runtime lifecycle unchanged, staged publish contract unchanged, manifest shape unchanged beyond the additive diagnostic fields, batching/widening/duplicate/route logic unchanged.
+
+---
+
 ## v1.5.0
 
 Production-readiness patch. Six locked contracts across runtime integrity, semantic quality, upgrade safety, and operational hygiene. 56 new regression tests; default suite expands from 34 → 90 tests.

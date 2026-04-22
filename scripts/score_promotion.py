@@ -6,10 +6,16 @@ Loads prompts/promotion-pass.md as the system prompt, sends a candidate batch
 returned verdicts against the Pass 1 output schema, and persists rejected /
 deferred candidates to JSONL. Emits one JSON summary object to stdout.
 
-Backends:
-- claude-code   (default) — shells out to `claude -p`
-- anthropic-sdk           — uses the anthropic Python SDK (requires ANTHROPIC_API_KEY)
-- file                    — reads a canned response; used for smoke tests
+Backends (v1.6.0+):
+- openclaw      (default) — ``openclaw infer model run --prompt ... --json``;
+                             the documented headless-inference CLI. Override
+                             the base command via ``MEMORY_PURIFIER_OPENCLAW_CMD``
+                             (base-command-only; script always appends the
+                             required infer subcommand + payload flags).
+- claude-code             — shells out to `claude -p` (legacy; still supported
+                             when the Claude CLI is installed).
+- anthropic-sdk           — uses the anthropic Python SDK (requires ANTHROPIC_API_KEY).
+- file                    — reads a canned response; used for smoke tests.
 """
 
 import argparse
@@ -23,9 +29,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _lib.time_utils import timestamp_triple  # noqa: E402
-
-
-DEFAULT_BACKEND = "claude-code"
+from _lib.backend import (  # noqa: E402
+    BACKEND_CHOICES,
+    BackendUnavailableError,
+    DEFAULT_BACKEND,
+    preflight_backend,
+)
 VALID_VERDICTS = {"reject", "defer", "compress", "merge", "promote"}
 SCORE_KEYS = [
     "durability",
@@ -217,6 +226,74 @@ def invoke_backend(
         )
         return {"raw": path.read_text(), "usage": _usage_unavailable()}
 
+    if backend == "openclaw":
+        # v1.6.0 (headless-inference surface) — uses the documented
+        # ``openclaw infer model run`` CLI. This is the correct surface
+        # for Pass 1 / Pass 2 stateless scoring.
+        #
+        # History note: an earlier v1.6.0 iteration used ``openclaw agent``,
+        # which is the interactive agent-turn / session surface. For
+        # batched scoring with no conversational state, the lighter-weight
+        # ``infer model run`` path is the documented one.
+        #
+        # Documented flags passed here (per ``openclaw infer model run --help``):
+        #   --prompt <text>   assembled scoring prompt + JSON payload body
+        #   --json            structured output envelope we parse below
+        #   --model <value>   optional provider/model override, accepts
+        #                     "provider/model" form (e.g. "anthropic/claude-opus-4-7").
+        #                     Only appended when the caller passes one.
+        #
+        # Deliberately NOT passed — not documented on ``infer model run``:
+        #   --session-id, --local, --message, --timeout, --max-tokens
+        #
+        # Override hatch — ``MEMORY_PURIFIER_OPENCLAW_CMD`` is a **base-command
+        # override only**: it replaces the openclaw executable prefix
+        # (e.g. ``"/custom/path/openclaw"`` or ``"env FOO=1 openclaw"``),
+        # while the script ALWAYS appends the required infer subcommand +
+        # ``--prompt`` body + ``--json`` + optional ``--model``. This keeps
+        # the override safe: operators can redirect to a wrapper without
+        # accidentally dropping the scoring payload or required flags.
+        # Unset → defaults to ``["openclaw"]``.
+        system_text = prompt_file.read_text()
+        user_text = json.dumps(input_payload, indent=2, ensure_ascii=False)
+        combined = (
+            f"{system_text}\n\n---\n\nInput payload:\n\n```json\n{user_text}\n```\n\n"
+            "Respond with the JSON envelope only."
+        )
+        override = os.environ.get("MEMORY_PURIFIER_OPENCLAW_CMD")
+        base_cmd = override.split() if override else ["openclaw"]
+        cmd = base_cmd + [
+            "infer", "model", "run",
+            "--prompt", combined,
+            "--json",
+        ]
+        if model:
+            cmd += ["--model", model]
+        proc = subprocess.run(
+            cmd, text=True, capture_output=True, timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"openclaw infer failed (rc={proc.returncode}): "
+                f"{(proc.stderr or '').strip()}"
+            )
+        # Parse the ``--json`` envelope and extract the model response.
+        # Field-name fallback order covers common OpenClaw response
+        # shapes; if none match, treat stdout as the response directly.
+        stdout = proc.stdout or ""
+        raw_response = stdout
+        try:
+            envelope = json.loads(stdout)
+            if isinstance(envelope, dict):
+                for field in ("response", "message", "content", "text", "output", "result"):
+                    val = envelope.get(field)
+                    if isinstance(val, str) and val.strip():
+                        raw_response = val
+                        break
+        except (json.JSONDecodeError, TypeError):
+            pass  # not JSON-wrapped; use raw stdout directly
+        return {"raw": raw_response, "usage": _usage_approximate(combined, raw_response)}
+
     if backend == "claude-code":
         cmd = ["claude", "-p"]
         if model:
@@ -308,7 +385,13 @@ def main() -> int:
     ap.add_argument("--prompt", help="Path to prompts/promotion-pass.md (default: resolved from script location)")
     ap.add_argument("--workspace", help="Workspace root override")
     ap.add_argument("--runtime-dir", help="Runtime dir override (default: <workspace>/runtime)")
-    ap.add_argument("--backend", default=None, help="Model backend: claude-code | anthropic-sdk | file")
+    ap.add_argument(
+        "--backend",
+        default=None,
+        choices=list(BACKEND_CHOICES) + [None],
+        help="Model backend (v1.6.0: openclaw | claude-code | anthropic-sdk | file). "
+             "Default from config or `_lib.backend.DEFAULT_BACKEND`.",
+    )
     ap.add_argument("--model", help="Model override")
     ap.add_argument("--max-tokens", type=int, help="Max output tokens")
     ap.add_argument("--fixture-dir", help="Fixture directory (backend=file)")
@@ -392,6 +475,27 @@ def main() -> int:
         return 0
 
     backend = args.backend or os.environ.get("MEMORY_PURIFIER_BACKEND") or DEFAULT_BACKEND
+
+    # v1.6.0 — preflight the selected backend BEFORE any subprocess work.
+    # Fails with an operator-readable message rather than an opaque
+    # mid-retry FileNotFoundError / import failure.
+    try:
+        preflight_backend(
+            backend,
+            fixture_dir=Path(args.fixture_dir) if args.fixture_dir else None,
+            fixture_file=Path(args.fixture_file) if args.fixture_file else None,
+        )
+    except BackendUnavailableError as e:
+        out = {
+            "status": "error",
+            "error": str(e),
+            "pass": "promotion",
+            "backend": backend,
+            "backend_preflight_failed": True,
+            **timestamp_triple(tz_name),
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
 
     workspace_hint = args.workspace or cand_obj.get("workspace") or os.environ.get("WORKSPACE")
     workspace = Path(workspace_hint).expanduser() if workspace_hint else (Path.home() / ".openclaw" / "workspace")
@@ -591,6 +695,11 @@ def main() -> int:
         "run_id": run_id,
         "pass": "promotion",
         "backend": backend,
+        # v1.6.0: operator-visible diagnosis fields so the cron supervisor /
+        # last-run report can surface "which backend ran, which model, how
+        # was token usage derived". Model is null when no override was set.
+        "backend_model": args.model,
+        "token_usage_source": (total_usage or {}).get("source"),
         "attempts": attempts,
         "mode": input_payload["mode"],
         "profile_scope": input_payload["profile_scope"],

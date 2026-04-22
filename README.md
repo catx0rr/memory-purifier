@@ -17,6 +17,66 @@ Scripts own orchestration, file I/O, validation, and retry. Prompts own semantic
 
 ---
 
+## How scoring works
+
+Purifier is not "summarizing memory" — it runs **deterministic orchestration** around two narrow **scoring passes**. The model's job is bounded judgment within a schema; the scripts' job is everything else (sourcing, batching, validation, retry, merging, routing, manifest commit). Scores drive bounded decisions, not open-ended behavior.
+
+### Pass 1 — Promotion scoring
+
+For every extracted candidate memory unit, Pass 1 emits a six-dimension score profile and a single verdict. Scripts then route the candidate: survivors enter Pass 2, non-survivors land in `rejected-candidates.jsonl` / `deferred-candidates.jsonl`.
+
+**Scoring dimensions (each ∈ [0.0, 1.0]):**
+
+| Dimension | What it measures |
+|---|---|
+| `durability` | How long this memory unit stays true — minutes vs. months vs. permanent |
+| `future_judgment_value` | Whether knowing this later will change a decision |
+| `action_value` | Whether it unlocks or constrains specific future actions |
+| `identity_relationship_weight` | Whether it anchors who/what the operator is or relates to |
+| `cross_time_persistence` | Expected recurrence across unrelated contexts |
+| `noise_risk` | Penalty — how likely this is a one-off artifact or transient chatter |
+
+Strength is a deterministic re-derivation: `sum(first five) − noise_risk`. The validator recomputes it and rejects Pass 1 output whose emitted `strength` drifts more than ±0.01 from the formula — so the model can't freelance on scoring math.
+
+**Verdicts (mutually exclusive):**
+
+| Verdict | Meaning | Next step |
+|---|---|---|
+| `reject` | Noise, transient, zero downstream value | Persisted to `rejected-candidates.jsonl` for audit; never re-considered |
+| `defer` | Not enough signal yet; revisit when a later candidate provides context | Persisted to `deferred-candidates.jsonl`; natural re-promotion on future runs |
+| `compress` | Duplicate/redundant with another candidate in the same batch | Folded into the `compress_target` (required field); source candidate is subsumed |
+| `merge` | Semantically linked with one or more siblings; becomes one cluster | Joined via `merge_candidate_ids[]`; survives together into Pass 2 |
+| `promote` | Stands on its own; goes to canonicalization | Survives into Pass 2 as a single-candidate cluster |
+
+### Pass 2 — Canonicalization and adjudication
+
+For each surviving cluster, Pass 2 produces one canonical claim with an eight-dimension score profile plus explicit routing/reuse/supersession decisions:
+
+| Dimension | What it measures |
+|---|---|
+| `semantic_cluster_confidence` | How confident we are that the clustered candidates genuinely belong together |
+| `canonical_clarity` | How crisp and unambiguous the canonical wording is |
+| `provenance_strength` | Quality + quantity of source pointers (direct > inferred > merged) |
+| `contradiction_pressure` | How much the cluster disagrees with active prior claims |
+| `freshness` | How recent the underlying material is |
+| `confidence` | Model's posterior confidence in the canonical text |
+| `route_fitness` | How well the chosen `primary_home` matches the claim type |
+| `supersession_confidence` | If the claim supersedes a prior, how confident the link is |
+
+### Deterministic scripts do the load-bearing decisions
+
+The scoring passes produce structured judgment; deterministic script code downstream uses **bounded, rerunnable rules** to turn that judgment into artifact state. Examples:
+
+- **Reuse** — `(normalized_subject, normalized_predicate, normalized_home)` triple match against active prior claims → stable id reuse; multi-match broken by most-recent `updatedAt`.
+- **Probable-duplicate** — graded similarity (composite 0.4 × subject + 0.2 × predicate + 0.2 × home + 0.2 × text_jaccard + 0.1 object bonus) above a 0.80 threshold → flag as `probable_duplicate` with back-pointer; wiki reconciler decides final collapse.
+- **Route affinity** — deterministic `(type, home)` table decides strong / acceptable / suspicious / impossible routing; impossible pairs hard-fail, suspicious ones warn.
+- **Prior-claim retrieval for Pass 2** — per-cluster top-K hard floor + global cap + same-subject bonus window + bounded contradiction-pressure widening → rerun-deterministic.
+- **Supersession-chain sanity** — warn (but don't auto-chain) when a new claim supersedes an already-superseded prior; reconciliation-mode Pass 2 resolves in its normal course.
+
+Scores inform decisions; scripts enforce the boundaries. Neither replaces the other.
+
+---
+
 ## Inputs
 
 Read-only, at `<workspace>/`:
@@ -145,23 +205,37 @@ Prompt philosophy: cron entrypoints are strictly execution prompts (no architect
 
 Stable hash IDs in `purified-claims.jsonl` (`cl-<16-hex>`) are **purifier-local artifact identifiers**. They exist for idempotency, supersession linkage, and contradiction cluster bookkeeping within purified state. They are **not** the canonical truth identifiers used by the downstream reconciler or wiki — the reconciler mints its own identity scheme when it compiles the wiki vault. The purifier *may suggest* identity (by reusing a prior id on a semantic `(subject, predicate, primary_home)` match), but the wiki decides final cross-layer canonical identity.
 
-## Maintenance behaviors (v1.5.0)
+## Maintenance behaviors (v1.6.0)
 
-Production-readiness patch. Six locked contracts across runtime integrity, semantic quality, upgrade safety, and operational hygiene.
+Emergency backend-correction patch. Scope: scoring backend default + invocation surface only. Zero purifier-architecture changes.
 
-- **Single-source timezone helper.** `scripts/_lib/time_utils.timestamp_triple()` replaces every per-script helper. Emitted timestamps use explicit `zoneinfo.ZoneInfo(tz_name)` — no host-TZ drift. `discover_sources.py` gained `--timezone` override so orchestrator tz propagates into every step.
-- **Transactional artifact commit with manifest-as-commit-marker.** Artifacts + views stage under `<staging>/publish/`; validation runs against the staged set; promotion is atomic in order JSONL → views → manifest LAST. `publishCommitted: true` is the single-file answer to "did this run publish?" Validation failure leaves prior runtime state untouched. `trigger_wiki` gates on `publishCommitted && status == "ok"` — defense-in-depth.
-- **Real batching.** `max_candidates_per_batch` / `max_clusters_per_batch` config limits are now consumed. Oversized runs obey `oversized_run_hard_cap`; strategies `"bounded_batches"` (partial) or `"split_and_queue"` (writes `pending-candidates-<run_id>.jsonl` for the next run). Deterministic chunk boundaries via sorted-id ordering.
-- **Adaptive retrieval widening.** Same-subject 30-day bonus window; contradiction-pressure widening (+3 extra slots per pressured cluster, globally capped at 30); reconciliation mode uses wider caps (120/10). Per-cluster top-K stays a hard floor — no cluster starvation.
-- **Probable-duplicate detection.** Every claim carries `duplicateDisposition ∈ {reuse_existing, probable_duplicate, new_claim}` + back-pointer + reason + normalization signature. Paraphrase drift surfaces as `probable_duplicate` with pointer; wiki reconciler owns final collapse — purifier never forces it.
-- **Type-home affinity validation.** Impossible pairs hard-fail (e.g., `method → HISTORY.md`). Acceptable pairs warn. Every claim carries `routeValidationState` / `routeAffinityScore` / `routeSuggestedHome` for inspection without rerunning the validator.
-- **Upgrade refuse-and-lock (Contract 3).** Four-version model (`logicVersion`, `manifestSchemaVersion`, `artifactSchemaVersion`, `runtimeStateVersion`) + `lastSuccessfulLogicVersion`. Version mismatch → refuse run, write `<locks_dir>/purifier-upgrade-pending-{from}-{to}.json`, exit 2. Operator unblocks with one manual `python3 scripts/run_purifier.py --acknowledge-upgrade` — forces reconciliation, clears lock. Future cron fires resume.
-- **Full cleanup matrix (Contract 6).** `run-<run_id>.lock` released on EVERY exit path. Staging preserved on failure; cleaned on `ok` / `skipped`. Pass-failure records preserved on failure. Debug retention via `--keep-staging` or `PURIFIER_DEBUG_RETAIN=1`.
-- **Config-defaulted warnings.** Missing optional config fields emit `config_defaulted` warnings in `manifest.warnings[]` instead of silently defaulting.
-- **Stale-sweep run-id propagation.** Stale-sweep inherits the orchestrator's run_id; no more synthetic `sweep-<uuid>`.
-- **Test coverage:** 56 new regression tests (default suite 34 → 90) covering timezone correctness + DST, transactional commit + failure modes, upgrade refuse-and-lock, batching + oversized, adaptive widening + anti-starvation, duplicate dispositions, type-home affinity, cleanup matrix, config-defaulted warnings, stale-sweep lineage.
+- **Default scoring backend is now `openclaw`.** v1.5.0 seeded `prompts.backend = "claude-code"` which assumed the Claude CLI on PATH — wrong for the OpenClaw deployment target. Fresh installs now seed `"openclaw"` at all three config surfaces (`install.sh`, `references/config-template.md`, `_lib/backend.DEFAULT_BACKEND`).
+- **OpenClaw invocation uses the documented headless-inference CLI:**
 
-For older maintenance behavior history (v1.4.0 and earlier), see [CHANGELOG.md](CHANGELOG.md).
+  ```
+  openclaw infer model run \
+    --prompt "<assembled prompt + JSON payload>" \
+    --json \
+    [--model <provider/model>]
+  ```
+
+  The `infer model run` surface is stateless and matches the batched Pass 1 / Pass 2 scoring shape. Two earlier iterations (`openclaw prompt --session isolated` and `openclaw agent --local --session-id ...`) were wrong and have been corrected — see CHANGELOG for the iteration history.
+
+- **Backend preflight fails loud and early.** `scripts/_lib/backend.py::preflight_backend()` runs BEFORE any subprocess invocation. If the selected backend's binary / SDK / fixture path is missing, it raises `BackendUnavailableError` with an operator-readable message naming the missing prerequisite and the config path to edit. No more opaque mid-retry `FileNotFoundError`.
+
+- **Legacy `claude-code` config surfaces a deprecation warning.** Installs whose `prompts.backend` still carries the pre-v1.6.0 default emit `backend_deprecated_default` in `manifest.warnings[]` on every run. Silent auto-migration of on-disk config was deliberately rejected in favor of transparency. If the `claude` binary IS still installed, runs proceed; if it's missing, the preflight fails with a clear "switch to `openclaw`" instruction.
+
+- **`MEMORY_PURIFIER_OPENCLAW_CMD` is a base-command override only.** Replaces the `openclaw` executable prefix (useful for wrapper scripts or `env VAR=X openclaw`-style prefixes), but the dispatch ALWAYS appends the required `infer model run --prompt ... --json --model?` tail. The override can never silently drop the scoring payload.
+
+- **All four backends remain supported:** `openclaw` (default), `claude-code`, `anthropic-sdk`, `file`. Argparse choices, `_lib.backend.BACKEND_CHOICES`, and `CANONICAL_TOP_LEVEL_STATUS_SET` all single-sourced so the three contract surfaces (manifest writer, validator, orchestrator) can never drift.
+
+- **Upgrade gate fires automatically for v1.5.0 → v1.6.0.** The logic-version bump (1.5.0 → 1.6.0) triggers the Contract 3 refuse-and-lock state machine on the first cron fire after upgrade. Operators run `python3 scripts/run_purifier.py --acknowledge-upgrade` once to clear the lock; that run forces reconciliation under v1.6.0 semantics and future cron fires resume normally.
+
+- **New diagnostic fields on scoring output:** `backend_model` + `token_usage_source` now surface on Pass 1 / Pass 2 JSON. Top-level orchestrator report adds `backend`, `backendModel`, `tokenUsageSource` for cron-supervisor and last-run.md visibility.
+
+- **Test coverage:** 35 new regression tests (default suite 121 → 157) covering fresh-install default, backend choice enum, preflight failures (openclaw missing, claude-code missing, bogus backend, file backend missing fixture), `openclaw infer model run` CLI contract (17 targeted assertions including base-command override, `--prompt` body, `--json` required, `--model` passthrough, envelope parsing), legacy-config deprecation warning, no-regression file-backend smoke, version-bump assertions.
+
+For older maintenance behavior history (v1.5.0 and earlier), see [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

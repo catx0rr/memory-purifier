@@ -10,10 +10,16 @@ Persistence (writing purified-claims.jsonl and friends) is NOT this script's
 job — that is Phase 5. This script only produces the validated canonical
 claim payload.
 
-Backends:
-- claude-code   (default) — shells out to `claude -p`
-- anthropic-sdk           — uses the anthropic Python SDK (requires ANTHROPIC_API_KEY)
-- file                    — reads a canned response; used for smoke tests
+Backends (v1.6.0+):
+- openclaw      (default) — ``openclaw infer model run --prompt ... --json``;
+                             the documented headless-inference CLI. Override
+                             the base command via ``MEMORY_PURIFIER_OPENCLAW_CMD``
+                             (base-command-only; script always appends the
+                             required infer subcommand + payload flags).
+- claude-code             — shells out to `claude -p` (legacy; still supported
+                             when the Claude CLI is installed).
+- anthropic-sdk           — uses the anthropic Python SDK (requires ANTHROPIC_API_KEY).
+- file                    — reads a canned response; used for smoke tests.
 """
 
 import argparse
@@ -28,9 +34,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _lib.time_utils import timestamp_triple  # noqa: E402
-
-
-DEFAULT_BACKEND = "claude-code"
+from _lib.backend import (  # noqa: E402
+    BACKEND_CHOICES,
+    BackendUnavailableError,
+    DEFAULT_BACKEND,
+    preflight_backend,
+)
 
 VALID_TYPES = {
     "fact", "lesson", "decision", "commitment", "constraint", "preference",
@@ -596,6 +605,56 @@ def invoke_backend(
         )
         return {"raw": path.read_text(), "usage": _usage_unavailable()}
 
+    if backend == "openclaw":
+        # v1.6.0 (headless-inference surface) — Pass 2 uses the same
+        # documented ``openclaw infer model run`` CLI as Pass 1. See
+        # ``score_promotion.py`` for the full contract note.
+        #
+        # Stateless by design: no ``--session-id`` / ``--local`` / ``--message``
+        # / ``--timeout`` — those are ``openclaw agent`` surface flags, not
+        # ``openclaw infer model run`` flags.
+        # ``MEMORY_PURIFIER_OPENCLAW_CMD`` is a **base-command override only**
+        # (see ``score_promotion.py`` for the full note). Script ALWAYS
+        # appends the infer subcommand + payload flags so the override
+        # can never drop the scoring args silently.
+        system_text = prompt_file.read_text()
+        user_text = json.dumps(input_payload, indent=2, ensure_ascii=False)
+        combined = (
+            f"{system_text}\n\n---\n\nInput payload:\n\n```json\n{user_text}\n```\n\n"
+            "Respond with the JSON envelope only."
+        )
+        override = os.environ.get("MEMORY_PURIFIER_OPENCLAW_CMD")
+        base_cmd = override.split() if override else ["openclaw"]
+        cmd = base_cmd + [
+            "infer", "model", "run",
+            "--prompt", combined,
+            "--json",
+        ]
+        if model:
+            cmd += ["--model", model]
+        proc = subprocess.run(
+            cmd, text=True, capture_output=True, timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"openclaw infer failed (rc={proc.returncode}): "
+                f"{(proc.stderr or '').strip()}"
+            )
+        # Parse the ``--json`` envelope and extract the model response.
+        stdout = proc.stdout or ""
+        raw_response = stdout
+        try:
+            envelope = json.loads(stdout)
+            if isinstance(envelope, dict):
+                for field in ("response", "message", "content", "text", "output", "result"):
+                    val = envelope.get(field)
+                    if isinstance(val, str) and val.strip():
+                        raw_response = val
+                        break
+        except (json.JSONDecodeError, TypeError):
+            pass  # not JSON-wrapped; use raw stdout directly
+        return {"raw": raw_response, "usage": _usage_approximate(combined, raw_response)}
+
     if backend == "claude-code":
         cmd = ["claude", "-p"]
         if model:
@@ -688,7 +747,13 @@ def main() -> int:
              "(scored just below min_score). Bounded by a global budget so contradiction "
              "pressure can't balloon the context.",
     )
-    ap.add_argument("--backend", default=None, help="Model backend: claude-code | anthropic-sdk | file")
+    ap.add_argument(
+        "--backend",
+        default=None,
+        choices=list(BACKEND_CHOICES) + [None],
+        help="Model backend (v1.6.0: openclaw | claude-code | anthropic-sdk | file). "
+             "Default from config or `_lib.backend.DEFAULT_BACKEND`.",
+    )
     ap.add_argument("--model", help="Model override")
     ap.add_argument("--max-tokens", type=int, help="Max output tokens")
     ap.add_argument("--fixture-dir", help="Fixture directory (backend=file)")
@@ -771,6 +836,26 @@ def main() -> int:
         return 0
 
     backend = args.backend or os.environ.get("MEMORY_PURIFIER_BACKEND") or DEFAULT_BACKEND
+
+    # v1.6.0 — preflight BEFORE any subprocess work. Fails with an
+    # operator-readable message rather than an opaque FileNotFoundError.
+    try:
+        preflight_backend(
+            backend,
+            fixture_dir=Path(args.fixture_dir) if args.fixture_dir else None,
+            fixture_file=Path(args.fixture_file) if args.fixture_file else None,
+        )
+    except BackendUnavailableError as e:
+        out = {
+            "status": "error",
+            "error": str(e),
+            "pass": "purifier",
+            "backend": backend,
+            "backend_preflight_failed": True,
+            **timestamp_triple(tz_name),
+        }
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        return 0
 
     workspace_hint = args.workspace or clusters_obj.get("workspace") or os.environ.get("WORKSPACE")
     workspace = Path(workspace_hint).expanduser() if workspace_hint else (Path.home() / ".openclaw" / "workspace")
@@ -955,6 +1040,9 @@ def main() -> int:
         "run_id": run_id,
         "pass": "purifier",
         "backend": backend,
+        # v1.6.0: surface model + token-usage source for operator diagnosis.
+        "backend_model": args.model,
+        "token_usage_source": (total_usage or {}).get("source"),
         "attempts": attempts,
         "mode": mode,
         "profile_scope": profile_scope,

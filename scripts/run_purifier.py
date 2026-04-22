@@ -162,6 +162,7 @@ def _build_final_report(
     global_memory_log_path: Path = None,
     latest_report_path: Path = None,
     skip_enrichment: dict = None,
+    pass1: dict = None,
 ) -> dict:
     """Build the single authoritative final JSON report emitted to stdout.
 
@@ -203,6 +204,12 @@ def _build_final_report(
         "partialFailureCount": len(partial_failures_list),
         "downstreamWikiIngestSuggested": downstream_suggested,
         "tokenUsage": token_usage or _usage_unavailable(),
+        # v1.6.0: surface backend info on the top-level report so operators
+        # and cron supervisors see which backend actually scored without
+        # drilling into sub-step outputs.
+        "backend": (pass2 or {}).get("backend") or (pass1 or {}).get("backend"),
+        "backendModel": (pass2 or {}).get("backend_model") or (pass1 or {}).get("backend_model"),
+        "tokenUsageSource": (token_usage or _usage_unavailable()).get("source"),
         "manifestPath": str(manifest_path),
         "summaryPath": str(summary_path),
         "globalMemoryLogPath": str(global_memory_log_path) if global_memory_log_path else None,
@@ -806,6 +813,27 @@ def _detect_config_defaulted(config: dict) -> list:
                 "default": default,
                 "reason": reason,
             })
+    # v1.6.0 backend-migration nudge: if the operator still has the
+    # pre-v1.6.0 default (`claude-code`) on disk, surface a non-blocking
+    # deprecation notice. The preflight fails loudly if the binary is
+    # missing; this warning is for operators whose claude CLI still works
+    # so they know the package default moved to `openclaw`.
+    prompts_cfg = config.get("prompts")
+    if isinstance(prompts_cfg, dict):
+        backend = prompts_cfg.get("backend")
+        if backend == "claude-code":
+            warnings.append({
+                "code": "backend_deprecated_default",
+                "from": "claude-code",
+                "to": "openclaw",
+                "reason": (
+                    "v1.6.0 changed the default backend to `openclaw`. "
+                    "The legacy `claude-code` backend still works when the "
+                    "`claude` CLI is installed, but the OpenClaw path is "
+                    "the intended default for this deployment. Update "
+                    "`prompts.backend` in memory-purifier.json at your leisure."
+                ),
+            })
     return warnings
 
 
@@ -1143,7 +1171,13 @@ def main() -> int:
     ap.add_argument("--runtime-dir", help="Runtime dir override")
     ap.add_argument("--telemetry-root", help="Package telemetry root (default: ~/.openclaw/telemetry/memory-purifier). Holds last-run.md directly (flat).")
     ap.add_argument("--global-log-root", help="Shared memory-log root (default: ~/.openclaw/telemetry). Memory-log JSONL appended here.")
-    ap.add_argument("--backend", help="Model backend for scoring passes: claude-code | anthropic-sdk | file")
+    ap.add_argument(
+        "--backend",
+        help="Model backend for scoring passes: openclaw (default, v1.6.0+) | "
+             "claude-code | anthropic-sdk | file. When omitted, resolves via "
+             "$MEMORY_PURIFIER_BACKEND → prompts.backend in memory-purifier.json → "
+             "_lib.backend.DEFAULT_BACKEND (`openclaw`).",
+    )
     ap.add_argument("--fixture-dir", help="Fixture directory (backend=file)")
     ap.add_argument("--timezone", help="IANA timezone name")
     ap.add_argument("--stale-lock-hours", type=int, default=STALE_LOCK_HOURS_DEFAULT, help="Overwrite a lock older than this (default: 2h)")
@@ -1677,6 +1711,7 @@ def main() -> int:
             dry_run=args.dry_run,
             steps=step_summary,
             assemble=assemble,
+            pass1=pass1,
             pass2=pass2,
             manifest=manifest_after_gate,
             validate=val,

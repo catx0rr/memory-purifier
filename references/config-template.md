@@ -10,7 +10,7 @@ This file is namespace-owned by `memory-purifier` — it carries only purifier-s
 
 ```json
 {
-  "version": "1.5.0",
+  "version": "1.6.0",
   "profile": "business",
   "timezone": "Asia/Manila",
   "cadence": {
@@ -24,7 +24,7 @@ This file is namespace-owned by `memory-purifier` — it carries only purifier-s
     "config_root": null
   },
   "prompts": {
-    "backend": "claude-code",
+    "backend": "openclaw",
     "model": null,
     "max_tokens": null
   },
@@ -63,7 +63,7 @@ This file is namespace-owned by `memory-purifier` — it carries only purifier-s
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `version` | string | `"1.5.0"` | Config schema version |
+| `version` | string | `"1.6.0"` | Config schema version |
 | `profile` | `"business" \| "personal"` | `"personal"` | Drives input eligibility (personal surfaces, personal-only homes). `install.sh --agent-profile <value>` controls the seeded value; omitting the flag seeds `personal`. |
 | `timezone` | IANA name | `"Asia/Manila"` | Used for cron registration and timestamp triples |
 | `cadence.incremental[]` | cron-expression strings | profile default | One or more cron expressions for incremental runs |
@@ -72,7 +72,7 @@ This file is namespace-owned by `memory-purifier` — it carries only purifier-s
 | `paths.runtime_dir` | abs path or `null` | `null` → `<workspace>/runtime` | Explicit live-runtime override (flat layout — purifier files live directly at this level with `purifier-` / `purified-` prefixes) |
 | `paths.telemetry_root` | abs path or `null` | `null` → `~/.openclaw/telemetry/memory-purifier` | Explicit telemetry override |
 | `paths.config_root` | abs path or `null` | `null` → `~/.openclaw/memory-purifier` | Explicit config-dir override |
-| `prompts.backend` | `"claude-code" \| "openclaw" \| "anthropic-sdk"` | `"claude-code"` | Which model backend the scoring passes invoke |
+| `prompts.backend` | `"openclaw" \| "claude-code" \| "anthropic-sdk" \| "file"` | `"openclaw"` | Which model backend the scoring passes invoke. v1.6.0 default is `openclaw`; legacy `claude-code` remains supported if the Claude CLI is installed. `file` is deterministic fixture mode for tests. |
 | `prompts.model` | string or `null` | `null` → backend default | Model override for both passes |
 | `prompts.max_tokens` | int or `null` | `null` → backend default | Output token cap per pass invocation |
 | `limits.max_candidates_per_batch` | int | `40` | Pass 1 batching ceiling |

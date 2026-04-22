@@ -98,7 +98,7 @@ All summary values **must** come from the runner's final JSON (or `$WORKSPACE/ru
 ⚗️ Memory purifier reconciliation completed. {claimsNew} new, {claimsTotal} total.
 ```
 
-`ok` + `full` — multi-line bullet report. Omit the entire `🪙 Token Usage` block (header + three bullets) when `tokenUsage.source == "unavailable"`:
+`ok` + `full` — multi-line bullet report. Omit the entire `Token Usage` block (header + three bullets) when `tokenUsage.source == "unavailable"`:
 
 ```
 ⚗️ Memory purifier reconciliation completed.

@@ -31,8 +31,8 @@ for the upgrade state machine.
 from __future__ import annotations
 
 
-PURIFIER_PACKAGE_VERSION: str = "1.5.0"
-PURIFIER_LOGIC_VERSION: str = "1.5.0"
+PURIFIER_PACKAGE_VERSION: str = "1.6.0"
+PURIFIER_LOGIC_VERSION: str = "1.6.0"
 PURIFIER_MANIFEST_SCHEMA: str = "1"
 PURIFIER_ARTIFACT_SCHEMA: str = "1"
 

@@ -35,6 +35,7 @@ from _lib.backend import (  # noqa: E402
     DEFAULT_BACKEND,
     preflight_backend,
 )
+from _lib.parse import PassOutputParseError, parse_pass_output  # noqa: E402
 VALID_VERDICTS = {"reject", "defer", "compress", "merge", "promote"}
 SCORE_KEYS = [
     "durability",
@@ -353,23 +354,12 @@ def _merge_usage(a: dict, b: dict) -> dict:
     }
 
 
+# v1.7.0: extract_json is now a thin wrapper around the shared
+# ``_lib.parse.parse_pass_output`` so Pass 1 and Pass 2 share one
+# hardened parser. Kept as a module-level name for back-compat with any
+# external caller that still imports ``extract_json`` from this module.
 def extract_json(raw: str):
-    raw = raw.strip()
-    if raw.startswith("```"):
-        lines = raw.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        raw = "\n".join(lines)
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end > start:
-            return json.loads(raw[start:end + 1])
-        raise
+    return parse_pass_output(raw)
 
 
 def _append_jsonl(path: Path, records: list) -> None:
@@ -564,10 +554,22 @@ def main() -> int:
                 last_errors = [f"batch {chunk_idx}: backend invocation failed: {type(e).__name__}: {e}"]
                 continue
 
+            # v1.7.0: parse with fast-fail on missing top-level envelope
+            # keys, and always keep the raw model output attached to the
+            # failure record when recovery fails.
             try:
-                parsed = extract_json(raw_response)
+                parsed = parse_pass_output(
+                    raw_response,
+                    required_top_level=("run_id", "verdicts"),
+                )
+            except PassOutputParseError as e:
+                last_errors = [
+                    f"batch {chunk_idx}: pass-1 JSON parse failed — {e.reason}; "
+                    f"recovery_attempts={e.recovery_attempts}"
+                ]
+                continue
             except Exception as e:
-                last_errors = [f"batch {chunk_idx}: JSON parse failed: {type(e).__name__}: {e}"]
+                last_errors = [f"batch {chunk_idx}: unexpected parse error: {type(e).__name__}: {e}"]
                 continue
 
             # When batching, the file-backend default fixture may carry

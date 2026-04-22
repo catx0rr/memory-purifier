@@ -205,37 +205,23 @@ Prompt philosophy: cron entrypoints are strictly execution prompts (no architect
 
 Stable hash IDs in `purified-claims.jsonl` (`cl-<16-hex>`) are **purifier-local artifact identifiers**. They exist for idempotency, supersession linkage, and contradiction cluster bookkeeping within purified state. They are **not** the canonical truth identifiers used by the downstream reconciler or wiki — the reconciler mints its own identity scheme when it compiles the wiki vault. The purifier *may suggest* identity (by reusing a prior id on a semantic `(subject, predicate, primary_home)` match), but the wiki decides final cross-layer canonical identity.
 
-## Maintenance behaviors (v1.6.0)
+## Maintenance behaviors (v1.7.0)
 
-Emergency backend-correction patch. Scope: scoring backend default + invocation surface only. Zero purifier-architecture changes.
+Emergency output-hardening patch. Scope: scoring-pass prompts + parser recovery only. Strictly additive — zero artifact-shape change, zero manifest schema change, zero refuse-and-lock gate fire for the v1.6.0 → v1.7.0 upgrade.
 
-- **Default scoring backend is now `openclaw`.** v1.5.0 seeded `prompts.backend = "claude-code"` which assumed the Claude CLI on PATH — wrong for the OpenClaw deployment target. Fresh installs now seed `"openclaw"` at all three config surfaces (`install.sh`, `references/config-template.md`, `_lib/backend.DEFAULT_BACKEND`).
-- **OpenClaw invocation uses the documented headless-inference CLI:**
+- **Prompt output discipline tightened.** Both scoring prompts (`prompts/promotion-pass.md` and `prompts/purifier-pass.md`) replaced the single loose "Return exactly one JSON object, no prose, no markdown fences" line with a **CRITICAL three-step block**: (1) begin with `{`, nothing before; (2) end with `}`, nothing after; (3) output ONLY the JSON — no fences, no code blocks, no commentary, no preambles, no trailing sentences. Placed immediately before the schema so the model reads the constraint right before emitting. Schema + all hard constraints (candidate_id-once, `strength ±0.01`, `merge_candidate_ids` only for merge, `compress_target` only for compress, probable-duplicate discipline) preserved verbatim.
 
-  ```
-  openclaw infer model run \
-    --prompt "<assembled prompt + JSON payload>" \
-    --json \
-    [--model <provider/model>]
-  ```
+- **Hardened shared parser with a formal recovery ladder.** New `scripts/_lib/parse.py` exposes `parse_pass_output(raw, *, required_top_level=())` and `PassOutputParseError`. Recovery ladder tries **direct JSON parse → fence-strip (for ``` ``` blocks) → brace-scan (for prose-around-JSON)** before giving up. Both `score_promotion.py` and `score_purifier.py` migrated to the shared parser; their local `extract_json` is now a thin wrapper. A recoverable drift (fenced JSON, chatty preamble, trailing sentence) no longer surfaces as a hard `partialFailures[]` entry.
 
-  The `infer model run` surface is stateless and matches the batched Pass 1 / Pass 2 scoring shape. Two earlier iterations (`openclaw prompt --session isolated` and `openclaw agent --local --session-id ...`) were wrong and have been corrected — see CHANGELOG for the iteration history.
+- **Fast-fail invariants.** Parser hard-rejects inputs that can't safely become Pass output: empty / whitespace-only, non-object top-level (array / string / number), JSON missing any key in `required_top_level` (`run_id` + `verdicts` for Pass 1, `run_id` + `canonical_claims` for Pass 2). Fast-fail messages name the specific missing key.
 
-- **Backend preflight fails loud and early.** `scripts/_lib/backend.py::preflight_backend()` runs BEFORE any subprocess invocation. If the selected backend's binary / SDK / fixture path is missing, it raises `BackendUnavailableError` with an operator-readable message naming the missing prerequisite and the config path to edit. No more opaque mid-retry `FileNotFoundError`.
+- **Raw preservation on every failure.** `PassOutputParseError.raw` carries the byte-for-byte original model output alongside `reason` and a `recovery_attempts` log of every ladder step tried. Failure records in `purifier-failed-*.json` now carry exactly what the model returned plus why each recovery step failed — no more "the parser gave up somewhere, good luck."
 
-- **Legacy `claude-code` config surfaces a deprecation warning.** Installs whose `prompts.backend` still carries the pre-v1.6.0 default emit `backend_deprecated_default` in `manifest.warnings[]` on every run. Silent auto-migration of on-disk config was deliberately rejected in favor of transparency. If the `claude` binary IS still installed, runs proceed; if it's missing, the preflight fails with a clear "switch to `openclaw`" instruction.
+- **Version bump policy — logic stays at 1.6.0.** `PURIFIER_PACKAGE_VERSION` bumped to `"1.7.0"` (release identifier; manifest `packageVersion`, install seeds). `PURIFIER_LOGIC_VERSION` deliberately **stays at `"1.6.0"`**: v1.7.0 is strictly additive hardening (stricter prompt rules + more-forgiving parser), no artifact shape change, no reprocessing needed. Firing the Contract 3 refuse-and-lock gate for v1.6.0 → v1.7.0 would be user-hostile churn for zero payoff. Fresh cron fires on existing v1.6.0 installs proceed normally after pulling v1.7.0 code.
 
-- **`MEMORY_PURIFIER_OPENCLAW_CMD` is a base-command override only.** Replaces the `openclaw` executable prefix (useful for wrapper scripts or `env VAR=X openclaw`-style prefixes), but the dispatch ALWAYS appends the required `infer model run --prompt ... --json --model?` tail. The override can never silently drop the scoring payload.
+- **Test coverage:** 18 new regression tests in `tests/test_parser_hardening.py` (default suite 157 → 175) covering: direct parse, prose-before JSON, prose-after JSON, fenced ```json block, bare ``` fence, prose-around-fenced combined, empty output, whitespace-only, gibberish with recovery-attempts log, top-level array rejected, top-level string rejected, Pass 1 missing `run_id`, Pass 1 missing `verdicts`, Pass 2 missing `canonical_claims`, raw-preserved across scenarios, integration smoke for both scoring scripts.
 
-- **All four backends remain supported:** `openclaw` (default), `claude-code`, `anthropic-sdk`, `file`. Argparse choices, `_lib.backend.BACKEND_CHOICES`, and `CANONICAL_TOP_LEVEL_STATUS_SET` all single-sourced so the three contract surfaces (manifest writer, validator, orchestrator) can never drift.
-
-- **Upgrade gate fires automatically for v1.5.0 → v1.6.0.** The logic-version bump (1.5.0 → 1.6.0) triggers the Contract 3 refuse-and-lock state machine on the first cron fire after upgrade. Operators run `python3 scripts/run_purifier.py --acknowledge-upgrade` once to clear the lock; that run forces reconciliation under v1.6.0 semantics and future cron fires resume normally.
-
-- **New diagnostic fields on scoring output:** `backend_model` + `token_usage_source` now surface on Pass 1 / Pass 2 JSON. Top-level orchestrator report adds `backend`, `backendModel`, `tokenUsageSource` for cron-supervisor and last-run.md visibility.
-
-- **Test coverage:** 35 new regression tests (default suite 121 → 157) covering fresh-install default, backend choice enum, preflight failures (openclaw missing, claude-code missing, bogus backend, file backend missing fixture), `openclaw infer model run` CLI contract (17 targeted assertions including base-command override, `--prompt` body, `--json` required, `--model` passthrough, envelope parsing), legacy-config deprecation warning, no-regression file-backend smoke, version-bump assertions.
-
-For older maintenance behavior history (v1.5.0 and earlier), see [CHANGELOG.md](CHANGELOG.md).
+For older maintenance behavior history (v1.6.0 and earlier), see [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

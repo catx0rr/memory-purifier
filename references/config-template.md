@@ -10,7 +10,7 @@ This file is namespace-owned by `memory-purifier` — it carries only purifier-s
 
 ```json
 {
-  "version": "1.6.0",
+  "version": "1.7.0",
   "profile": "business",
   "timezone": "Asia/Manila",
   "cadence": {
@@ -63,7 +63,7 @@ This file is namespace-owned by `memory-purifier` — it carries only purifier-s
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `version` | string | `"1.6.0"` | Config schema version |
+| `version` | string | `"1.7.0"` | Config schema version |
 | `profile` | `"business" \| "personal"` | `"personal"` | Drives input eligibility (personal surfaces, personal-only homes). `install.sh --agent-profile <value>` controls the seeded value; omitting the flag seeds `personal`. |
 | `timezone` | IANA name | `"Asia/Manila"` | Used for cron registration and timestamp triples |
 | `cadence.incremental[]` | cron-expression strings | profile default | One or more cron expressions for incremental runs |

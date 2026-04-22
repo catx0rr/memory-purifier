@@ -31,7 +31,13 @@ for the upgrade state machine.
 from __future__ import annotations
 
 
-PURIFIER_PACKAGE_VERSION: str = "1.6.0"
+PURIFIER_PACKAGE_VERSION: str = "1.7.0"
+# logicVersion stays at 1.6.0 — v1.7.0 is strictly additive hardening
+# (stricter prompt output rules + more-forgiving parser recovery); no
+# artifact-shape change, no reprocessing needed. Bumping logic would
+# fire the upgrade-required gate for every v1.6.0 install with no
+# corresponding need to rebuild state. Bump only when semantic behavior
+# changes in ways that invalidate prior artifact state.
 PURIFIER_LOGIC_VERSION: str = "1.6.0"
 PURIFIER_MANIFEST_SCHEMA: str = "1"
 PURIFIER_ARTIFACT_SCHEMA: str = "1"

@@ -4,6 +4,62 @@ All notable changes to `memory-purifier` are recorded here in reverse-chronologi
 
 ---
 
+## v1.7.0
+
+Emergency output-hardening patch. Scope: scoring-pass prompts + parser recovery only. Strictly additive — no artifact-shape change, no manifest schema change, no refuse-and-lock gate fire for v1.6.0 → v1.7.0.
+
+**Problem:** v1.6.0 shipped with loose "Return exactly one JSON object, no prose, no markdown fences" instructions in both scoring prompts. Models (especially chat-tuned variants dispatched via `openclaw infer model run`) still occasionally prepended a conversational preamble, wrapped the object in a ```json … ``` fence, or tacked a trailing sentence. Pass parsers could not always recover, so a recoverable drift presented as a hard Pass 1 / Pass 2 failure in `partialFailures[]`.
+
+**Fix:** Two-layer defense. Prompts got stricter output discipline; parser got a formal recovery ladder + fast-fail + raw-preservation contract. Either layer holds on its own; together they close the drift class.
+
+**Prompt-hardening changes** (commit `a5c19f0`):
+
+- **`prompts/promotion-pass.md`** and **`prompts/purifier-pass.md`** — replaced the single loose "Return exactly one JSON object, no prose, no markdown fences" line with a **CRITICAL three-step block** placed immediately before the schema:
+
+  ```md
+  **CRITICAL — follow these rules exactly, in this order:**
+
+  1. Begin your response with the character `{` — nothing before it, not even a newline or space.
+  2. End your response with the character `}` — nothing after it, not even a newline.
+  3. Output ONLY the JSON object below. No markdown fences. No code blocks. No explanation. No commentary. No preambles. No follow-up sentences.
+  ```
+
+  Schema, enum references, and all hard constraints (candidate_id appears once, `strength ±0.01` preservation, `merge_candidate_ids` only for merge, `compress_target` only for compress, probable-duplicate discipline, etc.) preserved verbatim.
+
+**Parser-hardening changes** (commit `536a07c`):
+
+- **`scripts/_lib/parse.py`** — NEW. 117-line shared module:
+  - `class PassOutputParseError(RuntimeError)` — carries `reason`, `raw` (byte-for-byte original model output), and `recovery_attempts` (log of ladder steps tried). Every failure preserves the raw output so operators can inspect what the model actually returned.
+  - `parse_pass_output(raw, *, required_top_level=())` — **recovery ladder** (direct JSON → fence-strip for ``` ``` blocks → brace-scan for prose-around-JSON), followed by **fast-fail invariants**: empty/whitespace output → error; non-object top-level (array / string / number) → error; missing any `required_top_level` key → error with the missing key named. Unrecoverable inputs raise `PassOutputParseError` with the full recovery-attempts trace attached.
+- **`scripts/score_promotion.py`** + **`scripts/score_purifier.py`** — migrated to the shared parser:
+  - Retry-loop parse call now invokes `parse_pass_output(raw_response, required_top_level=("run_id", "verdicts"))` / `("run_id", "canonical_claims")` and catches `PassOutputParseError` specifically so failure records carry the structured `reason` + `raw` instead of the generic `json.JSONDecodeError.msg`.
+  - Each script's local `extract_json` is now a thin wrapper around `parse_pass_output` — back-compat for callers, single-source recovery logic.
+- **`tests/test_parser_hardening.py`** — NEW. 18 regression tests in three classes:
+  - **`TestRecoveryLadder` (6 tests):** clean direct parse, prose-before JSON, prose-after JSON, fenced ```json block, bare ``` fence without language tag, prose-around-fenced combined.
+  - **`TestFastFail` (9 tests):** empty output, whitespace-only, gibberish (asserts `direct_failed` logged in attempts), top-level array rejected, top-level string rejected, missing `run_id` on Pass 1, missing `verdicts` on Pass 1, missing `canonical_claims` on Pass 2, raw preserved on every failure scenario.
+  - **`TestScoreScriptsUseHardenedParser` (3 tests):** integration smoke — `score_promotion.extract_json` recovers fenced input, `score_purifier.extract_json` recovers prose-before JSON, `score_promotion.extract_json` raises `PassOutputParseError` on gibberish (callers must catch for the retry loop).
+
+**Version policy — why logic stays at 1.6.0:**
+
+- `PURIFIER_PACKAGE_VERSION` bumped to `"1.7.0"` (release identifier; surfaces in docs, manifest `packageVersion`, install seed).
+- `PURIFIER_LOGIC_VERSION` **stays at `"1.6.0"`**. v1.7.0 changes are strictly additive hardening (stricter prompt output rules + more-forgiving parser recovery). No artifact-shape change. No reprocessing needed. Bumping logic would fire the Contract 3 refuse-and-lock gate on every v1.6.0 install with no corresponding need to rebuild state — user-hostile churn for zero payoff.
+- `PURIFIER_MANIFEST_SCHEMA` stays at `"1"`. `PURIFIER_ARTIFACT_SCHEMA` stays at `"1"`.
+- Install-seed surfaces bumped to 1.7.0 where package-level, kept at 1.6.0 where logic-level: `install.sh` lines 423, 501, 516, 517 → `"1.7.0"` (config seed, metadata seed, manifest `version` + `packageVersion`); lines 518, 521 kept at `"1.6.0"` (`logicVersion`, `lastSuccessfulLogicVersion`).
+
+**Files changed:**
+
+- Prompts: `prompts/promotion-pass.md`, `prompts/purifier-pass.md`
+- Parser: `scripts/_lib/parse.py` (new), `scripts/score_promotion.py`, `scripts/score_purifier.py`
+- Tests: `tests/test_parser_hardening.py` (new)
+- Version bump: `scripts/_lib/version.py`, `install.sh`, `references/config-template.md`
+- Docs: `README.md`, `CHANGELOG.md`
+
+**Tests:** 18 new regression tests in `tests/test_parser_hardening.py`. Default suite expands from 157 → 175 tests.
+
+**Zero architecture drift:** runtime lifecycle unchanged, staged publish contract unchanged, batching / widening / duplicate / route logic unchanged, backend dispatch unchanged, manifest shape unchanged. v1.7.0 strictly narrows the model-output → structured-data failure surface.
+
+---
+
 ## v1.6.0
 
 Emergency backend-correction patch. Scope: scoring-backend default only — zero purifier architecture changes.

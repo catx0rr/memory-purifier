@@ -241,13 +241,5 @@ For older maintenance behavior history (v1.5.0 and earlier), see [CHANGELOG.md](
 
 MIT — see [LICENSE](LICENSE).
 
-## Testing
-
-```bash
-bash tests/run_tests.sh
-```
-
-Runs the six regression scenarios (idempotency, supersession, profile routing, deletion, prior-claim ranking, downstream metric) end-to-end using real subprocess invocations of `run_purifier.py` against file-backed fixtures.
-
 Operator procedural contract: [`SKILL.md`](SKILL.md).
 Schema/contract reference: [`references/`](references/).

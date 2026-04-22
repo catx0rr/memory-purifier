@@ -71,7 +71,11 @@ Tie-breakers:
 
 ## Output
 
-Return exactly one JSON object, no prose, no markdown fences:
+**CRITICAL — follow these rules exactly, in this order:**
+
+1. Begin your response with the character `{` — nothing before it, not even a newline or space.
+2. End your response with the character `}` — nothing after it, not even a newline.
+3. Output ONLY the JSON object below. No markdown fences. No code blocks. No explanation. No commentary. No preambles. No follow-up sentences.
 
 ```json
 {
